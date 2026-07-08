@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: interview_user
+      POSTGRES_PASSWORD: root
+      POSTGRES_DB: interview_ai
+    ports:
+      - "5433:5432"
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
