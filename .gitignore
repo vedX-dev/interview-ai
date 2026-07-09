@@ -31,26 +31,18 @@ yarn-error.log*
 .pnpm-debug.log*
 
 # env files (can opt-in for committing if needed)
-.env*
-
-# vercel
-.vercel
+.env
+.env.local
+.env.production
+# Keep .env.example for GitHub
+!.env.example
 
 # typescript
 *.tsbuildinfo
 next-env.d.ts
 
-# Local environment variables
-.env
-.env.local
-.env.production
-
-# Dependencies
-node_modules/
-
-# Next.js build output
-.next/
-out/
+# vercel
+.vercel
 
 # Drizzle local files
 drizzle/
@@ -58,3 +50,6 @@ drizzle/
 # IDE files
 .vscode/
 .idea/
+
+# clerk configuration (can include secrets)
+/.clerk/
