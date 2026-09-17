@@ -79,7 +79,7 @@ export async function POST(request: Request) {
 
     const ai = new GoogleGenAI({ apiKey: geminiApiKey });
     const geminiResult = await ai.models.generateContent({
-      model: "gemini-1.5-flash",
+      model: "gemini-3.5-flash",
       contents: `Transcript context:\n${contextBlock}\n\nUser question:\n${body.query}`,
       config: {
         systemInstruction: RAG_SYSTEM_INSTRUCTION,

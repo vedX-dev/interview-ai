@@ -12,42 +12,53 @@ import {
 } from "@/src/schemas/orchestrator";
 import "@/src/lib/config";
 
-// Groq API integration
+// Groq API integration with active production models
 async function callGroqAPI(context: string, systemInstruction: string) {
   const groqApiKey = process.env.GROQ_API_KEY;
   if (!groqApiKey) {
     throw new Error("GROQ_API_KEY not configured");
   }
 
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${groqApiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "llama-3.3-70b-versatile",
-      messages: [
-        {
-          role: "system",
-          content: systemInstruction,
-        },
-        {
-          role: "user",
-          content: `${context}\n\nReturn JSON with exactly this shape:\n${JSON_OUTPUT_SHAPE}`,
-        },
-      ],
-      response_format: { type: "json_object" },
-      temperature: 0.7,
-    }),
-  });
+  const modelsToTry = ["groq/compound", "openai/gpt-oss-120b", "groq/compound-mini"];
+  let lastError: Error | null = null;
 
-  if (!response.ok) {
-    throw new Error(`Groq API failed: ${response.status}`);
+  for (const model of modelsToTry) {
+    try {
+      const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${groqApiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: systemInstruction },
+            { role: "user", content: `${context}\n\nReturn JSON with exactly this shape:\n${JSON_OUTPUT_SHAPE}` },
+          ],
+          response_format: { type: "json_object" },
+          temperature: 0.7,
+        }),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Groq model ${model} failed with status ${response.status}: ${errText}`);
+      }
+
+      const data = await response.json();
+      const content = data.choices?.[0]?.message?.content;
+      if (!content) {
+        throw new Error(`Groq model ${model} returned empty content`);
+      }
+
+      return content;
+    } catch (err: any) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+    }
   }
 
-  const data = await response.json();
-  return data.choices[0].message.content;
+  throw lastError || new Error("All Groq models failed");
 }
 
 const DEBUG = true; // Set to false in production
@@ -167,6 +178,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     const [interview] = await db
       .select({ 
         id: interviews.id,
+        status: interviews.status,
         currentPhase: interviews.currentPhase,
         geminiCallsCount: interviews.geminiCallsCount,
         totalTurns: interviews.totalTurns,
@@ -179,6 +191,17 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
     if (!interview) {
       return NextResponse.json({ error: "Interview not found" }, { status: 404 });
+    }
+
+    // Server-side guard: if interview is already closed/completed, do not generate AI response
+    if (interview.status === "completed" || interview.currentPhase === "closed") {
+      debugLog("[ORCHESTRATOR SERVER GUARD] Interview is already completed/closed, returning closed phase");
+      return NextResponse.json({
+        phase: "closed",
+        aiUtterance: "",
+        phaseComplete: true,
+        reasoning: "Interview is already closed/completed",
+      });
     }
 
     const geminiApiKey = process.env.GEMINI_API_KEY;

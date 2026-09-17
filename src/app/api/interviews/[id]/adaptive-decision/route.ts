@@ -47,14 +47,14 @@ const JSON_OUTPUT_SHAPE = `{
   "shouldContinue": "boolean (for acknowledge_redirect - whether to continue with current question)"
 }`;
 
-export async function POST(req: NextRequest, { params }: { params: { id: string } }) {
+export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { userId } = await auth();
     if (!userId) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const interviewId = params.id;
+    const { id: interviewId } = await params;
 
     // Verify user owns this interview
     const [interview] = await db
@@ -124,7 +124,7 @@ ${body.userResponse}
 Analyze this response and decide the next action using the rules provided.`;
 
     const geminiResult = await ai.models.generateContent({
-      model: "gemini-1.5-flash",
+      model: "gemini-3.5-flash",
       contents: `${context}\n\nReturn JSON with exactly this shape:\n${JSON_OUTPUT_SHAPE}`,
       config: {
         systemInstruction: SYSTEM_INSTRUCTION,

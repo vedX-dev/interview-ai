@@ -86,7 +86,7 @@ Target Job Role: ${jobRole}
 `;
 
     const geminiResult = await ai.models.generateContent({
-      model: "gemini-1.5-flash",
+      model: "gemini-3.5-flash",
       contents: `${resumeContext}\n\nGenerate a personalized interview plan with exactly this JSON shape:\n${JSON_OUTPUT_SHAPE}`,
       config: {
         systemInstruction: SYSTEM_INSTRUCTION,

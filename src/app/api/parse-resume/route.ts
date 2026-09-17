@@ -1,6 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 import { auth } from "@clerk/nextjs/server";
-import * as pdfjsLib from "pdfjs-dist";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import { ZodError } from "zod";
 import { db } from "@/src/db/index";
 import { resumes } from "@/src/db/schema";
@@ -144,7 +144,7 @@ export async function POST(request: Request) {
 
     const ai = new GoogleGenAI({ apiKey: geminiApiKey });
     const geminiResult = await ai.models.generateContent({
-      model: "gemini-1.5-flash",
+      model: "gemini-3.5-flash",
       contents: `Resume text:\n\n${cleanText}\n\nReturn JSON with exactly this shape:\n${JSON_OUTPUT_SHAPE}`,
       config: {
         systemInstruction: SYSTEM_INSTRUCTION,

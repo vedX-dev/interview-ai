@@ -112,7 +112,18 @@ export default function InterviewRoomPage() {
   const [currentPhase, setCurrentPhase] = useState<"greeting" | "rapport" | "technical" | "wrapup" | "closed">("greeting");
   const [totalTurns, setTotalTurns] = useState(0);
   const [candidateProfile, setCandidateProfile] = useState<any>(null);
+
+  // End Interview flow state
+  const [showEndModal, setShowEndModal] = useState(false);
+  const [isEnding, setIsEnding] = useState(false);
+  const [endingStep, setEndingStep] = useState<
+    "idle" | "stopping_audio" | "saving_transcript" | "finalizing" | "generating_feedback"
+  >("idle");
+  const isEndingRef = useRef(false);
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
   
+  const [isSessionLoaded, setIsSessionLoaded] = useState(false);
   const recognitionRef = useRef<any>(null);
   const synthesisRef = useRef<SpeechSynthesis | null>(null);
   const [jobRole, setJobRole] = useState("Software Developer");
@@ -120,16 +131,51 @@ export default function InterviewRoomPage() {
   const [ragQuery, setRagQuery] = useState("");
   const [isQueryingRag, setIsQueryingRag] = useState(false);
 
+  const transcriptContainerRef = useRef<HTMLDivElement>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const isAttemptingOrchestratorRef = useRef(false);
 
+  const [isUserScrolledUp, setIsUserScrolledUp] = useState(false);
+
   const isAiSpeaking = turnState === "ai_speaking";
+
+  const stopAllAudioAndMic = useCallback(() => {
+    console.log("[TEARDOWN] Halting audio playback and microphone input...");
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.onend = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.stop();
+      } catch (e) {
+        console.warn("Failed to stop speech recognition:", e);
+      }
+    }
+    setIsListening(false);
+
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch (e) {
+        console.warn("Failed to cancel speechSynthesis:", e);
+      }
+    }
+
+    if (currentAudioRef.current) {
+      try {
+        currentAudioRef.current.pause();
+        currentAudioRef.current = null;
+      } catch (e) {
+        console.warn("Failed to pause audio element:", e);
+      }
+    }
+  }, []);
 
   const appendTranscript = useCallback(
     async (content: string, speaker: "user" | "ai") => {
-      if (!interviewId) {
-        throw new Error("Missing interview session id");
+      if (!interviewId || isEndingRef.current) {
+        console.log("[TRANSCRIPT APPEND] Skipped - missing ID or interview terminating");
+        return;
       }
 
       const payload = { interviewId, content, speaker };
@@ -152,6 +198,8 @@ export default function InterviewRoomPage() {
         );
       }
 
+      if (isEndingRef.current) return;
+
       const entry = mapChunkToEntry(data as TranscriptChunkRecord);
       setTranscript((prev) => [...prev, entry]);
       return entry;
@@ -161,14 +209,20 @@ export default function InterviewRoomPage() {
 
   const speakAiQuestion = useCallback(
     async (questionText: string) => {
+      if (isEndingRef.current) {
+        console.log("[SPEAK AI] Skipped - interview is terminating");
+        return;
+      }
       console.log("[SPEAK AI] Question text:", questionText);
       if (!questionText || questionText.trim().length === 0) {
         console.error("[SPEAK AI] Empty question text provided");
-        throw new Error("Cannot speak empty question");
+        return;
       }
 
       setTurnState("ai_speaking");
       await appendTranscript(questionText, "ai");
+      
+      if (isEndingRef.current) return;
       
       // Try Sarvam TTS first if enabled
       if (ttsProvider === "sarvam") {
@@ -226,12 +280,15 @@ export default function InterviewRoomPage() {
     const audioUrl = URL.createObjectURL(audioBlob);
     
     const audio = new Audio(audioUrl);
+    currentAudioRef.current = audio;
     await new Promise<void>((resolve, reject) => {
       audio.onended = () => {
+        currentAudioRef.current = null;
         URL.revokeObjectURL(audioUrl);
         resolve();
       };
       audio.onerror = (e) => {
+        currentAudioRef.current = null;
         URL.revokeObjectURL(audioUrl);
         reject(new Error("Audio playback failed"));
       };
@@ -293,12 +350,45 @@ export default function InterviewRoomPage() {
     }
   };
 
+  const generateFeedback = useCallback(async () => {
+    if (!interviewId || isGeneratingFeedback) return;
+
+    setIsGeneratingFeedback(true);
+    setTurnState("processing");
+
+    try {
+      const response = await fetch(`/api/interviews/${interviewId}/feedback/generate`, {
+        method: "POST",
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(typeof data.error === "string" ? data.error : "Failed to generate feedback");
+      }
+
+      setFeedback(data);
+      setShowFeedback(true);
+      setTurnState("idle");
+      router.push(`/interview/${interviewId}/feedback`);
+    } catch (error) {
+      setTranscriptError(
+        error instanceof Error 
+          ? `Failed to generate feedback: ${error.message}. The interview completed but feedback generation failed.`
+          : "Failed to generate feedback. The interview completed but feedback generation failed.",
+      );
+      setTurnState("idle");
+    } finally {
+      setIsGeneratingFeedback(false);
+    }
+  }, [interviewId, isGeneratingFeedback, router]);
+
   const callOrchestrator = useCallback(async () => {
     console.log("[ORCHESTRATOR CALL] Interview ID being used:", interviewId);
     console.log("[ORCHESTRATOR CALL] Current totalTurns state:", totalTurns);
     console.log("[ORCHESTRATOR CALL] candidateProfile:", candidateProfile);
     
-    if (!interviewId) return;
+    if (!interviewId || isEndingRef.current) return;
 
     // Guard against multiple simultaneous calls
     if (isAttemptingOrchestratorRef.current) {
@@ -308,6 +398,9 @@ export default function InterviewRoomPage() {
 
     isAttemptingOrchestratorRef.current = true;
     console.log("[ORCHESTRATOR CALL] Set attempting flag to true");
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
 
     setIsAiThinking(true);
     setIsSwitchingProvider(false);
@@ -339,7 +432,13 @@ export default function InterviewRoomPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+        signal: controller.signal,
       });
+
+      if (isEndingRef.current || controller.signal.aborted) {
+        console.log("[ORCHESTRATOR] Interview terminated / aborted during fetch, ignoring response");
+        return;
+      }
 
       console.log("[ORCHESTRATOR] Response status:", response.status);
       
@@ -347,7 +446,6 @@ export default function InterviewRoomPage() {
         const errorText = await response.text();
         console.error("[ORCHESTRATOR] Error response:", errorText);
         
-        // Check if it's a provider switch
         if (response.headers.get("X-AI-Provider")) {
           const provider = response.headers.get("X-AI-Provider");
           setAiProvider(provider as "gemini" | "groq" | "fallback");
@@ -359,37 +457,43 @@ export default function InterviewRoomPage() {
       }
 
       const decision = await response.json() as OrchestratorDecision;
+
+      if (isEndingRef.current || controller.signal.aborted) {
+        console.log("[ORCHESTRATOR] Interview terminated / aborted after json parse, skipping utterance");
+        return;
+      }
       
-      // Check which provider was used
       if (response.headers.get("X-AI-Provider")) {
         const provider = response.headers.get("X-AI-Provider");
         setAiProvider(provider as "gemini" | "groq" | "fallback");
         console.log("[ORCHESTRATOR] AI provider used:", provider);
       }
       console.log("[ORCHESTRATOR] Decision:", decision);
-      console.log("[ORCHESTRATOR] aiUtterance field:", decision.aiUtterance);
       
       setCurrentPhase(decision.phase);
       setIsAiThinking(false);
 
       if (decision.phase === "closed") {
-        // Interview complete, generate feedback
         await generateFeedback();
       } else {
-        // Speak the AI's utterance
-        console.log("[ORCHESTRATOR] About to speak aiUtterance:", decision.aiUtterance);
         await speakAiQuestion(decision.aiUtterance);
       }
-    } catch (error) {
+    } catch (error: any) {
+      if (error?.name === "AbortError" || isEndingRef.current) {
+        console.log("[ORCHESTRATOR] Request aborted due to interview termination");
+        return;
+      }
       console.error("[ORCHESTRATOR] Error:", error);
       setIsAiThinking(false);
       setTranscriptError("Failed to get AI response. Please try again.");
       setTurnState("user_turn");
     } finally {
       isAttemptingOrchestratorRef.current = false;
-      console.log("[ORCHESTRATOR CALL] Reset attempting flag to false");
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
     }
-  }, [interviewId, currentPhase, transcript, candidateProfile, jobRole, totalTurns, speakAiQuestion]);
+  }, [interviewId, currentPhase, transcript, candidateProfile, jobRole, totalTurns, speakAiQuestion, generateFeedback]);
 
   // Check for speech recognition support on mount
   useEffect(() => {
@@ -456,12 +560,20 @@ export default function InterviewRoomPage() {
 
         console.log("[LOAD SESSION] Loaded interview:", interview.id, "Phase:", interview.currentPhase);
 
+        if (interview?.status === "completed" || interview?.currentPhase === "closed") {
+          console.log("[LOAD SESSION] Interview is completed/closed. Redirecting to feedback page...");
+          isEndingRef.current = true;
+          router.push(`/interview/${interviewId}/feedback`);
+          return;
+        }
+
         setJobRole(interview?.jobRole ?? "Software Developer");
         setCurrentPhase((interview?.currentPhase as any) || "greeting");
         setCandidateProfile(interview?.feedback?.candidateProfile || null);
 
         const entries = chunks.map(mapChunkToEntry);
         setTranscript(entries);
+        setIsSessionLoaded(true);
 
         // If transcript is empty, this is a fresh interview - call orchestrator for greeting
         if (entries.length === 0) {
@@ -502,7 +614,7 @@ export default function InterviewRoomPage() {
 
   // Separate effect to call orchestrator when needed
   useEffect(() => {
-    if (turnState !== "processing" || transcript.length === 0) return;
+    if (!isSessionLoaded || isEndingRef.current || turnState !== "processing" || transcript.length === 0) return;
     
     const lastEntry = transcript[transcript.length - 1];
     if (lastEntry.speaker === "user") {
@@ -510,20 +622,42 @@ export default function InterviewRoomPage() {
       console.log("[EFFECT] Calling orchestrator after user response");
       void callOrchestrator();
     }
-  }, [transcript, turnState, callOrchestrator]);
+  }, [isSessionLoaded, transcript, turnState, callOrchestrator]);
 
   // Call orchestrator on first load if transcript is empty
   useEffect(() => {
-    console.log("[EFFECT] First load check - turnState:", turnState, "transcript length:", transcript.length);
-    if (turnState === "processing" && transcript.length === 0 && interviewId) {
+    console.log("[EFFECT] First load check - turnState:", turnState, "transcript length:", transcript.length, "isSessionLoaded:", isSessionLoaded);
+    if (isSessionLoaded && !isEndingRef.current && turnState === "processing" && transcript.length === 0 && interviewId) {
       console.log("[EFFECT] Calling orchestrator for initial greeting");
       void callOrchestrator();
     }
-  }, [turnState, transcript.length, interviewId, callOrchestrator]);
+  }, [isSessionLoaded, turnState, transcript.length, interviewId, callOrchestrator]);
 
+  const handleTranscriptScroll = useCallback(() => {
+    const container = transcriptContainerRef.current;
+    if (!container) return;
+
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    const isNearBottom = distanceFromBottom < 80;
+
+    setIsUserScrolledUp(!isNearBottom);
+  }, []);
+
+  // Smart auto-scroll: Only scroll to bottom on new entries if candidate is already near bottom
   useEffect(() => {
-    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [transcript]);
+    const container = transcriptContainerRef.current;
+    if (!container) {
+      transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      return;
+    }
+
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    const isNearBottom = distanceFromBottom < 100;
+
+    if (isNearBottom || !isUserScrolledUp) {
+      transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [transcript, isUserScrolledUp]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -634,36 +768,54 @@ export default function InterviewRoomPage() {
     }
   };
 
-  const generateFeedback = async () => {
-    if (!interviewId || isGeneratingFeedback) return;
+  const handleConfirmEndInterview = async () => {
+    setShowEndModal(false);
+    setIsEnding(true);
+    isEndingRef.current = true;
 
+    // 1. Abort any in-flight orchestrator requests immediately
+    if (abortControllerRef.current) {
+      try {
+        console.log("[TEARDOWN] Aborting in-flight orchestrator fetch request");
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      } catch (e) {
+        console.warn("Failed to abort orchestrator controller:", e);
+      }
+    }
+
+    // 2. Stop microphone & audio playback
+    setEndingStep("stopping_audio");
+    stopAllAudioAndMic();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // 3. Saving transcript & finalizing
+    setEndingStep("saving_transcript");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    setEndingStep("finalizing");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // 4. Generating feedback
+    setEndingStep("generating_feedback");
     setIsGeneratingFeedback(true);
-    setTurnState("processing");
 
     try {
       const response = await fetch(`/api/interviews/${interviewId}/feedback/generate`, {
         method: "POST",
       });
-
       const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(typeof data.error === "string" ? data.error : "Failed to generate feedback");
+      if (response.ok) {
+        setFeedback(data);
       }
-
-      setFeedback(data);
-      setShowFeedback(true);
-      setTurnState("idle");
-    } catch (error) {
-      setTranscriptError(
-        error instanceof Error 
-          ? `Failed to generate feedback: ${error.message}. The interview completed but feedback generation failed.`
-          : "Failed to generate feedback. The interview completed but feedback generation failed.",
-      );
-      setTurnState("idle");
+    } catch (err) {
+      console.error("[END INTERVIEW] Error generating feedback:", err);
     } finally {
       setIsGeneratingFeedback(false);
     }
+
+    // 5. Navigate candidate to /interview/[id]/feedback
+    router.push(`/interview/${interviewId}/feedback`);
   };
 
   const handleRagQuery = async () => {
@@ -787,6 +939,19 @@ export default function InterviewRoomPage() {
                 <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
               </svg>
             )}
+          </button>
+
+          {/* End Interview Secondary Button */}
+          <button
+            type="button"
+            onClick={() => setShowEndModal(true)}
+            disabled={isEnding}
+            className="flex items-center gap-2 rounded-lg border border-red-900/60 bg-red-950/40 px-3 py-2 text-xs font-semibold text-red-400 hover:bg-red-900/60 hover:text-red-300 transition-colors disabled:opacity-50 shadow-sm"
+          >
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M16 8l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2M5 3a2 2 0 00-2 2v1c0 8.284 6.716 15 15 15h1a2 2 0 002-2v-3.28a1 1 0 00-.684-.948l-4.493-1.498a1 1 0 00-1.21.502l-1.13 2.257a11.042 11.042 0 01-5.516-5.517l2.257-1.128a1 1 0 00.502-1.21L9.228 3.684A1 1 0 008.279 3H5z" />
+            </svg>
+            <span>End Interview</span>
           </button>
         </div>
       </header>
@@ -920,7 +1085,7 @@ export default function InterviewRoomPage() {
         </section>
 
         {/* Right — Conversation Transcript */}
-        <section className="flex flex-col overflow-hidden">
+        <section className="relative flex flex-col overflow-hidden">
           <div className="border-b border-zinc-800 px-4 py-2 flex items-center justify-between">
             <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
               Conversation Transcript
@@ -932,7 +1097,11 @@ export default function InterviewRoomPage() {
             </div>
           </div>
 
-          <div className="flex-1 space-y-3 overflow-y-auto p-4">
+          <div
+            ref={transcriptContainerRef}
+            onScroll={handleTranscriptScroll}
+            className="flex-1 space-y-3 overflow-y-auto p-4 scroll-smooth"
+          >
             {transcript.length === 0 ? (
               <p className="text-sm text-zinc-500">
                 {turnState === "processing"
@@ -1012,6 +1181,23 @@ export default function InterviewRoomPage() {
             
             <div ref={transcriptEndRef} />
           </div>
+
+          {/* Floating Jump-to-bottom Pill when user is scrolled up */}
+          {isUserScrolledUp && (
+            <button
+              type="button"
+              onClick={() => {
+                transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+                setIsUserScrolledUp(false);
+              }}
+              className="absolute bottom-20 right-6 z-20 flex items-center gap-1.5 rounded-full border border-purple-500/50 bg-purple-950/90 px-3.5 py-1.5 text-xs font-semibold text-purple-200 shadow-xl backdrop-blur-md hover:bg-purple-900 transition-all hover:scale-105 active:scale-95"
+            >
+              <svg className="h-3.5 w-3.5 text-purple-300 animate-bounce" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+              </svg>
+              <span>Scroll to latest</span>
+            </button>
+          )}
 
           <div className="border-t border-zinc-800 bg-zinc-900/60 p-4">
             <label
@@ -1280,8 +1466,108 @@ export default function InterviewRoomPage() {
         </div>
       )}
 
+      {/* 2. Confirmation Modal (Accidental Ending Protection) */}
+      {showEndModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-zinc-800 bg-zinc-900 p-6 text-center space-y-5 shadow-2xl">
+            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-red-950/60 border border-red-800/50 text-red-500">
+              <svg className="h-7 w-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+              </svg>
+            </div>
+
+            <div className="space-y-2">
+              <h2 className="text-xl font-bold text-white">End this interview?</h2>
+              <p className="text-sm text-zinc-400 leading-relaxed">
+                Your current transcript will be saved and the interview will be evaluated based on the responses completed so far.
+              </p>
+            </div>
+
+            <div className="flex gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowEndModal(false)}
+                className="flex-1 rounded-xl border border-zinc-700 bg-zinc-800 px-4 py-3 text-sm font-semibold text-zinc-300 hover:bg-zinc-700 hover:text-white transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmEndInterview}
+                className="flex-1 rounded-xl bg-red-600 px-4 py-3 text-sm font-semibold text-white hover:bg-red-500 transition-colors shadow-lg shadow-red-900/30"
+              >
+                End Interview
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 3 & 4. Ending Interview & Generating Feedback Progress Screen */}
+      {isEnding && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-6 backdrop-blur-md">
+          <div className="w-full max-w-sm rounded-2xl border border-zinc-800 bg-zinc-900 p-8 text-center space-y-6 shadow-2xl">
+            <div className="relative mx-auto flex h-16 w-16 items-center justify-center">
+              <div className="h-full w-full animate-spin rounded-full border-4 border-purple-500/20 border-t-purple-500" />
+            </div>
+
+            <div className="space-y-1">
+              <h2 className="text-xl font-bold text-white">
+                {endingStep === "generating_feedback" ? "Generating Your Feedback" : "Ending Interview..."}
+              </h2>
+              <p className="text-xs text-zinc-400">
+                {endingStep === "generating_feedback"
+                  ? "Our AI is analyzing your responses..."
+                  : "Stopping audio & saving data"}
+              </p>
+            </div>
+
+            <div className="space-y-3 text-left border-t border-zinc-800/80 pt-4 text-xs font-medium">
+              <div className="flex items-center gap-3 text-zinc-300">
+                <span className={`flex h-5 w-5 items-center justify-center rounded-full ${
+                  endingStep !== "stopping_audio" ? "bg-emerald-900/80 text-emerald-400 font-bold" : "bg-purple-900/50 text-purple-300 animate-pulse font-bold"
+                }`}>✓</span>
+                <span>Stopping microphone</span>
+              </div>
+              <div className="flex items-center gap-3 text-zinc-300">
+                <span className={`flex h-5 w-5 items-center justify-center rounded-full ${
+                  endingStep === "saving_transcript" || endingStep === "finalizing" || endingStep === "generating_feedback"
+                    ? "bg-emerald-900/80 text-emerald-400 font-bold"
+                    : "bg-zinc-800 text-zinc-500"
+                }`}>✓</span>
+                <span>Stopping AI audio</span>
+              </div>
+              <div className="flex items-center gap-3 text-zinc-300">
+                <span className={`flex h-5 w-5 items-center justify-center rounded-full ${
+                  endingStep === "finalizing" || endingStep === "generating_feedback"
+                    ? "bg-emerald-900/80 text-emerald-400 font-bold"
+                    : "bg-zinc-800 text-zinc-500"
+                }`}>✓</span>
+                <span>Saving transcript</span>
+              </div>
+              <div className="flex items-center gap-3 text-zinc-300">
+                <span className={`flex h-5 w-5 items-center justify-center rounded-full ${
+                  endingStep === "generating_feedback"
+                    ? "bg-emerald-900/80 text-emerald-400 font-bold"
+                    : "bg-zinc-800 text-zinc-500"
+                }`}>✓</span>
+                <span>Finalizing interview</span>
+              </div>
+              <div className="flex items-center gap-3 text-zinc-300">
+                <span className={`flex h-5 w-5 items-center justify-center rounded-full ${
+                  endingStep === "generating_feedback"
+                    ? "bg-purple-900/80 text-purple-300 animate-pulse font-bold"
+                    : "bg-zinc-800 text-zinc-500"
+                }`}>⟳</span>
+                <span>Redirecting to feedback...</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Generating Feedback Overlay */}
-      {isGeneratingFeedback && (
+      {isGeneratingFeedback && !isEnding && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80">
           <div className="text-center">
             <div className="h-12 w-12 animate-spin rounded-full border-4 border-purple-500/30 border-t-purple-500 mx-auto mb-4" />
