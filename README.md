@@ -1,25 +1,40 @@
-Note- No new technology stack is required for this phase. The core InterviewAI architecture and integrations are already established. Continue using the existing stack and patterns. The current work is completion, debugging, UX refinement, reliability improvements, and production hardening—not replacing or introducing a new architecture unless a clearly documented requirement makes it necessary.
+## Current Development Status
 
-**JOB** 
+**INTERVIEWER AI — Under Build**
 
-The core InterviewAI platform is functional across authentication, dashboard, lobby, live voice interview, transcript storage, AI orchestration, interview termination, and feedback generation.
+The core InterviewAI platform is functional across authentication, dashboard, lobby, live voice interview, transcript storage, AI orchestration, interview termination, feedback evaluation, and real-time D-ID avatar integration.
 
-**Current Phase:** Phase 2 — Feedback & Evaluation Flow
+> **Note:** No new technology stack is required for this phase. The core InterviewAI architecture and integrations are already established. Current work focuses on UX refinement, layout efficiency, latency optimization, reliability, and production hardening.
 
-Current flow:
-Finalize & Save Transcript
-      ✅ DONE
-      ↓
-Evaluate Responses with AI
-      ⚠️ Backend exists, needs end-to-end verification
-      ↓
-Generate Score + Strengths + Gaps + Question Analysis
-      ⚠️ Feedback generation logic exists
-      ↓
-Feedback Report
-      ⚠️ UI built
-      ↓
-Dashboard / Download
-      ⏳ Not fully completed yet
+**Current Phase:** Phase 4 — Real-Time Interview UX Refinement
 
-`Live Interview → End Interview → Confirmation → Save Transcript → Generate Feedback → Feedback Report`
+### Current Goal
+
+Refine the live interview environment after full-screen entry so the interface efficiently uses the available viewport, keeps the D-ID interviewer and candidate visible without excessive space consumption, and provides a fully usable independently scrollable conversation transcript.
+
+### Current Flow
+
+`Interview Environment → Full-Screen Prompt → Enter Full Screen & Start → Connect D-ID → Live Interview UI → Gemini Response → D-ID Avatar Speaks → Candidate Response → Scrollable Transcript → Continue Interview → End Interview → Feedback`
+
+### Phase Status
+
+D-ID Real-Time Avatar  
+✅ DONE
+
+Gemini → D-ID Speech  
+✅ DONE
+
+Full-Screen Entry  
+✅ DONE
+
+Latency Optimization  
+⚠️ IN PROGRESS
+
+Responsive Live Interview Layout  
+⚠️ IN PROGRESS
+
+Independent Transcript Scrolling  
+⚠️ IN PROGRESS
+
+End Interview + Feedback  
+✅ DONE

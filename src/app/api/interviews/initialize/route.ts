@@ -94,7 +94,10 @@ export async function POST(req: NextRequest) {
         `${req.nextUrl.origin}/api/interviews/${createdInterview.id}/orchestrator`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            ...(req.headers.get("cookie") ? { cookie: req.headers.get("cookie")! } : {}),
+          },
           body: JSON.stringify({
             interviewId: createdInterview.id,
             currentPhase: "greeting",

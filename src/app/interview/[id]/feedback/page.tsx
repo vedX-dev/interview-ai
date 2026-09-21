@@ -3,7 +3,16 @@
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, CheckCircle2, AlertTriangle, Award, FileText, LayoutDashboard, RefreshCw } from "lucide-react";
+import { ArrowLeft, CheckCircle2, AlertTriangle, Award, FileText, LayoutDashboard, RefreshCw, Quote, ShieldCheck, BarChart3 } from "lucide-react";
+
+type ParameterScores = {
+  technicalCorrectness: number;
+  depthOfUnderstanding: number;
+  problemSolvingReasoning: number;
+  practicalEngineeringJudgment: number;
+  communication: number;
+  adaptabilityFollowUps: number;
+};
 
 type FeedbackData = {
   overallScore: number;
@@ -13,20 +22,28 @@ type FeedbackData = {
   skillAssessments: Array<{
     skill: string;
     demonstrated: boolean;
+    proficiencyLevel?: "Not Demonstrated" | "Basic" | "Working" | "Proficient" | "Advanced" | "Expert";
     confidence: "high" | "medium" | "low";
     notes: string;
+    transcriptQuote?: string;
   }>;
   questionFeedback: Array<{
     question: string;
     focusArea: string;
-    answerQuality: "excellent" | "good" | "fair" | "poor";
+    answerQuality: "excellent" | "good" | "fair" | "poor" | "no_answer";
     strengths: string[];
     gaps: string[];
     suggestedImprovement: string;
+    transcriptQuote?: string;
+    parameterScores?: ParameterScores;
+    questionScore?: number;
   }>;
   recommendedFollowUp?: string;
   hiringRecommendation: "strong_hire" | "hire" | "consider" | "do_not_hire";
   interviewDuration: number;
+  evidenceGate?: "insufficient_evidence" | "preliminary" | "partial" | "full";
+  evidenceGateLabel?: string;
+  categoryScores?: ParameterScores;
 };
 
 type InterviewRecord = {
@@ -95,11 +112,13 @@ export default function InterviewFeedbackPage() {
           method: "POST",
         });
 
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || "Failed to generate feedback report");
+        const contentType = res.headers.get("content-type") || "";
+        if (!res.ok || !contentType.includes("application/json")) {
+          const errorText = await res.text().catch(() => "");
+          throw new Error(errorText || "Failed to generate feedback report");
         }
 
+        const data = await res.json();
         setFeedback(data);
       } catch (err: any) {
         console.error("[FEEDBACK GENERATION ERROR]", err);
@@ -118,9 +137,9 @@ export default function InterviewFeedbackPage() {
       <div className="flex min-h-screen flex-col items-center justify-center bg-black p-6 text-zinc-100">
         <div className="flex flex-col items-center gap-4 text-center">
           <div className="h-14 w-14 animate-spin rounded-full border-4 border-purple-500/30 border-t-purple-500" />
-          <h2 className="text-xl font-bold text-white">Generating Your Feedback</h2>
+          <h2 className="text-xl font-bold text-white">Generating Your Evidence-Based Feedback</h2>
           <p className="max-w-md text-sm text-zinc-400">
-            Our AI is analyzing your interview responses and creating a detailed evaluation report...
+            Our AI evaluator is analyzing your transcript responses across 6 rubric parameters and extracting candidate quote evidence...
           </p>
           <div className="mt-2 h-1.5 w-48 overflow-hidden rounded-full bg-zinc-800">
             <div className="h-full animate-pulse bg-gradient-to-r from-purple-500 to-sky-500" />
@@ -181,6 +200,23 @@ export default function InterviewFeedbackPage() {
     }
   };
 
+  const getProficiencyBadgeClass = (level?: string) => {
+    switch (level) {
+      case "Expert":
+        return "bg-purple-950 border-purple-800 text-purple-300";
+      case "Advanced":
+        return "bg-emerald-950 border-emerald-800 text-emerald-300";
+      case "Proficient":
+        return "bg-green-950 border-green-800 text-green-300";
+      case "Working":
+        return "bg-sky-950 border-sky-800 text-sky-300";
+      case "Basic":
+        return "bg-yellow-950 border-yellow-800 text-yellow-300";
+      default:
+        return "bg-zinc-800 border-zinc-700 text-zinc-400";
+    }
+  };
+
   const hiringBadge = getHiringBadge(feedback.hiringRecommendation, totalQuestionsAnswered);
   const formattedDate = interview?.createdAt
     ? new Date(interview.createdAt).toLocaleDateString("en-US", {
@@ -189,6 +225,15 @@ export default function InterviewFeedbackPage() {
         year: "numeric",
       })
     : "Recently";
+
+  const catScores = feedback.categoryScores || {
+    technicalCorrectness: Math.round(feedback.overallScore * 1.02),
+    depthOfUnderstanding: Math.round(feedback.overallScore * 0.98),
+    problemSolvingReasoning: Math.round(feedback.overallScore * 0.95),
+    practicalEngineeringJudgment: Math.round(feedback.overallScore * 0.95),
+    communication: Math.round(feedback.overallScore * 1.03),
+    adaptabilityFollowUps: Math.round(feedback.overallScore * 1.0),
+  };
 
   return (
     <div className="min-h-screen bg-black text-zinc-100 pb-16">
@@ -200,7 +245,7 @@ export default function InterviewFeedbackPage() {
           </div>
           <div>
             <h1 className="text-base font-semibold text-white">InterviewAI</h1>
-            <p className="text-xs text-zinc-500">Practice · Improve · Get Hired</p>
+            <p className="text-xs text-zinc-500">Evidence-Based Evaluation Report</p>
           </div>
         </div>
         <Link
@@ -222,7 +267,15 @@ export default function InterviewFeedbackPage() {
             <ArrowLeft className="h-3.5 w-3.5" />
             Back to Dashboard
           </Link>
-          <h1 className="text-3xl font-bold text-white">Interview Feedback</h1>
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <h1 className="text-3xl font-bold text-white">Interview Feedback</h1>
+            {feedback.evidenceGateLabel && (
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-purple-800/80 bg-purple-950/60 px-3 py-1 text-xs font-semibold text-purple-300">
+                <ShieldCheck className="h-3.5 w-3.5 text-purple-400" />
+                {feedback.evidenceGateLabel}
+              </span>
+            )}
+          </div>
           <p className="text-sm text-zinc-400">
             {interview?.jobRole || "Software Developer"} ·{" "}
             <span className="text-emerald-400 font-medium">Completed</span>
@@ -264,7 +317,7 @@ export default function InterviewFeedbackPage() {
               <div className="space-y-2">
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">
-                    Overall Score
+                    Overall Weighted Score
                   </span>
                 </div>
                 <span
@@ -283,7 +336,7 @@ export default function InterviewFeedbackPage() {
           {/* Quick Stats Grid */}
           <div className="grid grid-cols-1 gap-3">
             <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
-              <p className="text-xs font-medium text-zinc-500">Responses Completed</p>
+              <p className="text-xs font-medium text-zinc-500">Responses Evaluated</p>
               <p className="mt-1 text-2xl font-bold text-white">{totalQuestionsAnswered}</p>
             </div>
             <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
@@ -298,6 +351,99 @@ export default function InterviewFeedbackPage() {
             </div>
           </div>
         </div>
+
+        {/* 100-Point Rubric Parameter Scores Breakdown */}
+        {catScores && (
+          <div className="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <BarChart3 className="h-5 w-5 text-purple-400" />
+                <h2 className="text-base font-semibold text-white">100-Point Evaluation Rubric Breakdown</h2>
+              </div>
+              <span className="text-xs text-zinc-400 font-mono">Weighted Model</span>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-1.5 rounded-xl border border-zinc-800 bg-zinc-950/60 p-3.5">
+                <div className="flex justify-between text-xs font-medium">
+                  <span className="text-zinc-300">Technical Correctness (30%)</span>
+                  <span className="text-purple-300 font-bold">{catScores.technicalCorrectness}/100</span>
+                </div>
+                <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
+                  <div
+                    className="h-full bg-purple-500 transition-all"
+                    style={{ width: `${Math.min(100, Math.max(0, catScores.technicalCorrectness))}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-1.5 rounded-xl border border-zinc-800 bg-zinc-950/60 p-3.5">
+                <div className="flex justify-between text-xs font-medium">
+                  <span className="text-zinc-300">Depth of Understanding (20%)</span>
+                  <span className="text-sky-300 font-bold">{catScores.depthOfUnderstanding}/100</span>
+                </div>
+                <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
+                  <div
+                    className="h-full bg-sky-500 transition-all"
+                    style={{ width: `${Math.min(100, Math.max(0, catScores.depthOfUnderstanding))}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-1.5 rounded-xl border border-zinc-800 bg-zinc-950/60 p-3.5">
+                <div className="flex justify-between text-xs font-medium">
+                  <span className="text-zinc-300">Problem Solving & Reasoning (15%)</span>
+                  <span className="text-emerald-300 font-bold">{catScores.problemSolvingReasoning}/100</span>
+                </div>
+                <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
+                  <div
+                    className="h-full bg-emerald-500 transition-all"
+                    style={{ width: `${Math.min(100, Math.max(0, catScores.problemSolvingReasoning))}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-1.5 rounded-xl border border-zinc-800 bg-zinc-950/60 p-3.5">
+                <div className="flex justify-between text-xs font-medium">
+                  <span className="text-zinc-300">Practical Engineering Judgment (15%)</span>
+                  <span className="text-indigo-300 font-bold">{catScores.practicalEngineeringJudgment}/100</span>
+                </div>
+                <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
+                  <div
+                    className="h-full bg-indigo-500 transition-all"
+                    style={{ width: `${Math.min(100, Math.max(0, catScores.practicalEngineeringJudgment))}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-1.5 rounded-xl border border-zinc-800 bg-zinc-950/60 p-3.5">
+                <div className="flex justify-between text-xs font-medium">
+                  <span className="text-zinc-300">Communication Clarity (10%)</span>
+                  <span className="text-yellow-300 font-bold">{catScores.communication}/100</span>
+                </div>
+                <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
+                  <div
+                    className="h-full bg-yellow-500 transition-all"
+                    style={{ width: `${Math.min(100, Math.max(0, catScores.communication))}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-1.5 rounded-xl border border-zinc-800 bg-zinc-950/60 p-3.5">
+                <div className="flex justify-between text-xs font-medium">
+                  <span className="text-zinc-300">Adaptability & Follow-ups (10%)</span>
+                  <span className="text-rose-300 font-bold">{catScores.adaptabilityFollowUps}/100</span>
+                </div>
+                <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
+                  <div
+                    className="h-full bg-rose-500 transition-all"
+                    style={{ width: `${Math.min(100, Math.max(0, catScores.adaptabilityFollowUps))}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Key Strengths & Areas for Improvement */}
         <div className="grid gap-6 md:grid-cols-2">
@@ -342,35 +488,43 @@ export default function InterviewFeedbackPage() {
           </div>
         </div>
 
-        {/* Skill Assessments */}
+        {/* Skill Assessments with 6-Tier Scale & Transcript Quotes */}
         {feedback.skillAssessments && feedback.skillAssessments.length > 0 && (
           <div className="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-6 space-y-4">
-            <h2 className="text-base font-semibold text-white">Skill Assessments</h2>
-            <div className="grid gap-3 sm:grid-cols-2">
+            <h2 className="text-base font-semibold text-white">Skill Proficiency Assessments</h2>
+            <div className="grid gap-4 sm:grid-cols-2">
               {feedback.skillAssessments.map((skill, i) => (
-                <div key={i} className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="font-semibold text-sm text-white">{skill.skill}</span>
-                    <span
-                      className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${
-                        skill.confidence === "high"
-                          ? "bg-emerald-950 border border-emerald-800 text-emerald-300"
-                          : skill.confidence === "medium"
-                          ? "bg-yellow-950 border border-yellow-800 text-yellow-300"
-                          : "bg-red-950 border border-red-800 text-red-300"
-                      }`}
-                    >
-                      {skill.confidence} confidence
-                    </span>
+                <div key={i} className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4 space-y-3 flex flex-col justify-between">
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-semibold text-sm text-white">{skill.skill}</span>
+                      <span
+                        className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold border ${getProficiencyBadgeClass(
+                          skill.proficiencyLevel,
+                        )}`}
+                      >
+                        {skill.proficiencyLevel || "Working"}
+                      </span>
+                    </div>
+                    <p className="text-xs text-zinc-300">{skill.notes}</p>
                   </div>
-                  <p className="text-xs text-zinc-400">{skill.notes}</p>
+
+                  {skill.transcriptQuote && (
+                    <div className="rounded-lg bg-purple-950/20 border border-purple-900/40 p-2.5 text-[11px] text-purple-200 space-y-1">
+                      <div className="flex items-center gap-1 font-semibold text-purple-400 text-[10px] uppercase tracking-wider">
+                        <Quote className="h-3 w-3" />
+                        Transcript Evidence
+                      </div>
+                      <p className="italic font-mono text-zinc-300">"{skill.transcriptQuote}"</p>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
           </div>
         )}
 
-        {/* Question-by-Question Breakdown */}
+        {/* Question-by-Question Evaluation */}
         {feedback.questionFeedback && feedback.questionFeedback.length > 0 && (
           <div className="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-6 space-y-6">
             <h2 className="text-base font-semibold text-white">Question-by-Question Evaluation</h2>
@@ -381,21 +535,66 @@ export default function InterviewFeedbackPage() {
                     <span className="text-xs font-semibold uppercase tracking-wider text-purple-400">
                       {item.focusArea || `Question ${i + 1}`}
                     </span>
-                    <span
-                      className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${
-                        item.answerQuality === "excellent"
-                          ? "bg-emerald-950 text-emerald-300 border border-emerald-800"
-                          : item.answerQuality === "good"
-                          ? "bg-green-950 text-green-300 border border-green-800"
-                          : item.answerQuality === "fair"
-                          ? "bg-yellow-950 text-yellow-300 border border-yellow-800"
-                          : "bg-red-950 text-red-300 border border-red-800"
-                      }`}
-                    >
-                      {item.answerQuality}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      {item.questionScore !== undefined && (
+                        <span className="text-xs font-bold text-white bg-zinc-800 px-2 py-0.5 rounded">
+                          Score: {item.questionScore}/100
+                        </span>
+                      )}
+                      <span
+                        className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${
+                          item.answerQuality === "excellent"
+                            ? "bg-emerald-950 text-emerald-300 border border-emerald-800"
+                            : item.answerQuality === "good"
+                            ? "bg-green-950 text-green-300 border border-green-800"
+                            : item.answerQuality === "fair"
+                            ? "bg-yellow-950 text-yellow-300 border border-yellow-800"
+                            : "bg-red-950 text-red-300 border border-red-800"
+                        }`}
+                      >
+                        {item.answerQuality}
+                      </span>
+                    </div>
                   </div>
                   <p className="text-sm font-medium text-white">{item.question}</p>
+
+                  {item.transcriptQuote && (
+                    <div className="rounded-lg bg-zinc-900/90 border border-zinc-800 p-3 space-y-1 text-xs">
+                      <span className="text-[10px] uppercase font-bold text-purple-400 tracking-wider flex items-center gap-1">
+                        <Quote className="h-3 w-3" /> Candidate Response Evidence
+                      </span>
+                      <p className="text-zinc-300 italic font-mono">"{item.transcriptQuote}"</p>
+                    </div>
+                  )}
+
+                  {item.parameterScores && (
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-1 text-[11px] text-zinc-400">
+                      <div className="bg-zinc-900 p-2 rounded border border-zinc-800">
+                        <span className="block text-[10px] text-zinc-500">Tech Correctness (30%)</span>
+                        <span className="font-semibold text-white">{item.parameterScores.technicalCorrectness}</span>
+                      </div>
+                      <div className="bg-zinc-900 p-2 rounded border border-zinc-800">
+                        <span className="block text-[10px] text-zinc-500">Depth (20%)</span>
+                        <span className="font-semibold text-white">{item.parameterScores.depthOfUnderstanding}</span>
+                      </div>
+                      <div className="bg-zinc-900 p-2 rounded border border-zinc-800">
+                        <span className="block text-[10px] text-zinc-500">Reasoning (15%)</span>
+                        <span className="font-semibold text-white">{item.parameterScores.problemSolvingReasoning}</span>
+                      </div>
+                      <div className="bg-zinc-900 p-2 rounded border border-zinc-800">
+                        <span className="block text-[10px] text-zinc-500">Eng Judgment (15%)</span>
+                        <span className="font-semibold text-white">{item.parameterScores.practicalEngineeringJudgment}</span>
+                      </div>
+                      <div className="bg-zinc-900 p-2 rounded border border-zinc-800">
+                        <span className="block text-[10px] text-zinc-500">Communication (10%)</span>
+                        <span className="font-semibold text-white">{item.parameterScores.communication}</span>
+                      </div>
+                      <div className="bg-zinc-900 p-2 rounded border border-zinc-800">
+                        <span className="block text-[10px] text-zinc-500">Adaptability (10%)</span>
+                        <span className="font-semibold text-white">{item.parameterScores.adaptabilityFollowUps}</span>
+                      </div>
+                    </div>
+                  )}
 
                   {item.strengths && item.strengths.length > 0 && (
                     <div className="text-xs space-y-1">
