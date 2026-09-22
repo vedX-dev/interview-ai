@@ -110,7 +110,7 @@ export default function InterviewRoomPage() {
   
   // Orchestrator state
   const [isAiThinking, setIsAiThinking] = useState(false);
-  const [aiProvider, setAiProvider] = useState<"gemini" | "groq" | "fallback">("gemini");
+  const [aiProvider, setAiProvider] = useState<"gemini" | "groq" | "pool" | "fallback">("gemini");
   const [isSwitchingProvider, setIsSwitchingProvider] = useState(false);
   const [ttsProvider, setTtsProvider] = useState<"browser" | "sarvam">("browser");
   const [currentPhase, setCurrentPhase] = useState<"greeting" | "rapport" | "technical" | "wrapup" | "closed">("greeting");
@@ -155,6 +155,65 @@ export default function InterviewRoomPage() {
 
   // Measure timing from page mount
   const mountTimeRef = useRef<number>(performance.now());
+
+  // Prediction worker: fire-and-forget debounce ref (min 3s between calls)
+  const lastPredictTimeRef = useRef<number>(0);
+  /**
+   * Stable turn ID for stale-pool rejection:
+   * set to transcript.length when the candidate starts speaking this turn.
+   * The orchestrator discards any pool whose turnId does not match.
+   */
+  const speakingTurnIdRef = useRef<number>(0);
+  /** Monotonically increments within a turn each time predict fires. */
+  const predictVersionRef = useRef<number>(0);
+  const PREDICT_DEBOUNCE_MS = 3000;
+
+  /**
+   * Fire-and-forget call to the prediction worker during candidate speech.
+   * Called from the STT onresult interim handler — must never throw or
+   * cause any UI state change. Errors are silently swallowed.
+   */
+  const triggerPredict = useCallback(
+    (interimText: string) => {
+      if (!interviewId) return;
+      // Debounce: only call once every PREDICT_DEBOUNCE_MS
+      const now = Date.now();
+      if (now - lastPredictTimeRef.current < PREDICT_DEBOUNCE_MS) return;
+      lastPredictTimeRef.current = now;
+
+      const recentTranscript = transcript
+        .slice(-6)
+        .map((e) => ({ speaker: e.speaker, content: e.text }));
+
+      // Increment version within this turn
+      predictVersionRef.current += 1;
+      const version = predictVersionRef.current;
+      const turnId = speakingTurnIdRef.current;
+
+      // Fire-and-forget — explicitly do not await
+      fetch(`/api/interviews/${interviewId}/predict`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          interviewId,
+          interimTranscript: interimText,
+          phase: currentPhase,
+          resumeData: candidateProfile,
+          recentTranscript,
+          turnId,
+          predictionVersion: version,
+        }),
+      }).catch((err) => {
+        // Prediction failures are silent — orchestrator will fall back to Gemini
+        console.debug("[PREDICT] Fire-and-forget failed (non-fatal):", err);
+      });
+
+      console.log(
+        `[PREDICT] Fired prediction for phase=${currentPhase}, turnId=${turnId}, version=${version}, interim length=${interimText.length}`,
+      );
+    },
+    [interviewId, currentPhase, transcript, candidateProfile],
+  );
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -808,6 +867,12 @@ export default function InterviewRoomPage() {
     recognition.onstart = () => {
       setIsListening(true);
       setInterimTranscript("");
+      // Stamp the turn ID the moment the candidate starts this utterance.
+      // transcript.length at this point = number of saved entries before this turn.
+      speakingTurnIdRef.current = transcript.length;
+      // Reset version counter for this new turn
+      predictVersionRef.current = 0;
+      lastPredictTimeRef.current = 0; // allow first predict to fire immediately
     };
     
     recognition.onresult = (event: SpeechRecognitionEvent) => {
@@ -821,7 +886,10 @@ export default function InterviewRoomPage() {
         setIsListening(false);
         void handleSpeak(finalText);
       } else {
-        setInterimTranscript(currentResult[0].transcript);
+        const interimText = currentResult[0].transcript;
+        setInterimTranscript(interimText);
+        // Fire-and-forget prediction worker while candidate is still speaking
+        triggerPredict(interimText);
       }
     };
     

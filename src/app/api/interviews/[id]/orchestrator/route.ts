@@ -5,11 +5,17 @@ import { NextRequest, NextResponse } from "next/server";
 import { z, ZodError } from "zod";
 import { db } from "@/src/db/index";
 import { interviews, transcriptChunks } from "@/src/db/schema";
-import { 
-  OrchestratorRequestSchema, 
+import {
+  OrchestratorRequestSchema,
   OrchestratorDecisionSchema,
-  type OrchestratorRequest 
+  type OrchestratorRequest,
 } from "@/src/schemas/orchestrator";
+import { getPool, clearPool } from "@/src/lib/pool";
+import {
+  buildCoverageMap,
+  formatCoverageForPrompt,
+} from "@/src/lib/state-engine";
+import { runLocalDecisionEngine } from "@/src/lib/local-decision-engine";
 import "@/src/lib/config";
 
 // Groq API integration with active production models
@@ -242,11 +248,88 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       })
       .where(eq(interviews.id, interviewId));
 
-    // Build context based on phase
-    const context = buildContext(body, interview.currentPhase || "greeting");
+    // ─── STATE ENGINE: Derive coverage map from transcript ───────────────────
+    const coverageMap = buildCoverageMap(
+      body.transcript.map((t) => ({ speaker: t.speaker, content: t.content })),
+    );
+    const coverageSummary = formatCoverageForPrompt(coverageMap);
+    debugLog("Coverage map:", coverageSummary);
+
+    // ─── POOL-HIT CHECK: Local Decision Engine ────────────────────────────────
+    // The prediction worker may have pre-generated candidates while the
+    // candidate was speaking. The local decision engine validates the pool
+    // against the candidate's FINAL answer using deterministic constraints
+    // before accepting any question.
+    if (
+      body.currentPhase === "technical" ||
+      body.currentPhase === "rapport" ||
+      body.currentPhase === "wrapup"
+    ) {
+      try {
+        const pool = getPool(interviewId);
+        if (pool && pool.questions.length > 0) {
+          debugLog(
+            `[POOL] Found ${pool.questions.length} candidate(s) for turnId=${pool.turnId}, v=${pool.predictionVersion}`,
+          );
+
+          // The final answer is the last user entry in the transcript
+          const lastUserEntry = [...body.transcript]
+            .reverse()
+            .find((t) => t.speaker === "user");
+          const finalAnswer = lastUserEntry?.content ?? "";
+
+          // currentTurnId = current transcript length (after user entry saved)
+          const currentTurnId = body.transcript.length;
+
+          const decision = runLocalDecisionEngine(
+            pool,
+            finalAnswer,
+            currentTurnId,
+            coverageMap,
+            body.currentPhase,
+          );
+
+          // Always clear the pool after inspection (accepted or rejected)
+          clearPool(interviewId);
+
+          if (decision.accepted) {
+            console.log(`[ORCHESTRATOR] ✅ Local engine accepted pool question — ${decision.reason}`);
+
+            // Update DB phase if it changed
+            if (body.currentPhase !== interview.currentPhase) {
+              await db
+                .update(interviews)
+                .set({ currentPhase: body.currentPhase })
+                .where(eq(interviews.id, interviewId));
+            }
+
+            const poolResponse = NextResponse.json({
+              phase: body.currentPhase,
+              aiUtterance: decision.question.text,
+              phaseComplete: false,
+              reasoning: decision.reason,
+            });
+            poolResponse.headers.set("X-AI-Provider", "pool");
+            return poolResponse;
+          }
+
+          debugLog(`[POOL] Rejected — ${decision.reason}`);
+        } else {
+          debugLog("[POOL] No pool available — proceeding with LLM");
+        }
+      } catch (poolError) {
+        // Pool failure is non-fatal — proceed to LLM generation
+        console.warn("[POOL] Decision engine failed, falling through to LLM:", poolError);
+      }
+    }
+
+    // ─── FULL LLM PATH ────────────────────────────────────────────────────────
+    // Build context based on phase, now enriched with state-engine coverage
+    const context = buildContext(body, interview.currentPhase || "greeting", coverageSummary);
     debugLog("Context:", context);
 
-    const systemInstruction = PHASE_INSTRUCTIONS[body.currentPhase as keyof typeof PHASE_INSTRUCTIONS];
+    const systemInstruction =
+      PHASE_INSTRUCTIONS[body.currentPhase as keyof typeof PHASE_INSTRUCTIONS];
 
     const aiResult = await callAIWithFallback(context, systemInstruction);
     console.log(`[ORCHESTRATOR] Using AI provider: ${aiResult.provider}`);
@@ -326,7 +409,11 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   }
 }
 
-function buildContext(body: OrchestratorRequest, currentPhase: string): string {
+function buildContext(
+  body: OrchestratorRequest,
+  currentPhase: string,
+  coverageSummary?: string,
+): string {
   const { transcript, resumeData, jobRole } = body;
 
   let context = `Current Phase: ${currentPhase}\n`;
@@ -341,9 +428,22 @@ function buildContext(body: OrchestratorRequest, currentPhase: string): string {
     context += `- Projects: ${resumeData.coreProjects.map((p: { title: string }) => p.title).join(", ")}\n\n`;
   }
 
+  // Inject state-engine coverage summary so Gemini does not have to
+  // re-derive interview state from the full raw transcript.
+  if (coverageSummary) {
+    context += `${coverageSummary}\n\n`;
+  }
+
   if (transcript.length > 0) {
-    context += `Conversation So Far:\n`;
-    transcript.forEach((entry: { speaker: string; content: string }, i: number) => {
+    // Only send the last 8 turns to keep the prompt compact.
+    // The coverage summary above carries the structural context.
+    const recentTurns = transcript.slice(-8);
+    const omitted = transcript.length - recentTurns.length;
+    if (omitted > 0) {
+      context += `[${omitted} earlier turn(s) omitted — see Coverage Summary above]\n`;
+    }
+    context += `Recent Conversation:\n`;
+    recentTurns.forEach((entry: { speaker: string; content: string }, i: number) => {
       context += `${i + 1}. [${entry.speaker.toUpperCase()}]: ${entry.content}\n`;
     });
     context += "\n";
