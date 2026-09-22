@@ -1,5 +1,16 @@
 ## Current Development Status
 
+## Commands in Use
+| Command | Action |Use as per requirement |
+|---|---|
+| `impeccable shape [feature]` | Plan a new UX/UI feature or flow before writing code |
+| `impeccable document` | Generate `DESIGN.md` from your current codebase |
+| `impeccable audit` | Run technical checks for responsiveness, performance & accessibility |
+| `impeccable polish` | Pass over current UI to improve visual hierarchy and micro-interactions |
+| `impeccable bolder` | Make safe or subtle UI elements stand out dramatically |
+| `impeccable animate` | Add smooth, purposeful micro-animations to components |
+## 
+
 **INTERVIEWER AI — Under Build**
 
 The core InterviewAI platform is functional across authentication, dashboard, lobby, live voice interview, transcript storage, AI orchestration, interview termination, feedback evaluation, and real-time D-ID avatar integration.
