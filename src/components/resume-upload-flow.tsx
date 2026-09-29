@@ -51,10 +51,11 @@ export function ResumeUploadFlow({ onSuccess }: ResumeUploadFlowProps) {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Handle PDF file selection & conversion to base64
   const processFile = async (selectedFile: File) => {
-    if (!selectedFile.name.toLowerCase().endsWith(".pdf")) {
-      setError("Please upload a valid PDF document (.pdf).");
+    const ext = selectedFile.name.toLowerCase().split(".").pop();
+    const validExts = ["pdf", "docx", "txt", "md"];
+    if (!ext || !validExts.includes(ext)) {
+      setError("Please upload a valid document (.pdf, .docx, .txt, or .md).");
       return;
     }
 
@@ -318,7 +319,7 @@ export function ResumeUploadFlow({ onSuccess }: ResumeUploadFlowProps) {
               type="file"
               ref={fileInputRef}
               onChange={handleFileChange}
-              accept=".pdf"
+              accept=".pdf,.docx,.txt,.md"
               className="hidden"
             />
 
@@ -327,13 +328,13 @@ export function ResumeUploadFlow({ onSuccess }: ResumeUploadFlowProps) {
             </div>
 
             <h3 className="text-base font-semibold text-white">
-              Drop your PDF resume here, or{" "}
+              Drop your resume here, or{" "}
               <span className="text-violet-400 underline decoration-violet-400/40 underline-offset-4">
                 browse
               </span>
             </h3>
             <p className="mt-1 text-xs text-zinc-400 max-w-sm">
-              Supports standard text-based PDF resumes (Max 5MB). AI will extract skills, experience, and key projects.
+              Supports PDF, DOCX, TXT, or Markdown resumes (Max 5MB). AI will extract skills, experience, and key projects.
             </p>
 
             <div className="mt-6 flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-950/60 px-4 py-1.5 text-[11px] text-zinc-400">

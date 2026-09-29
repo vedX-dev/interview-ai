@@ -1,28 +1,26 @@
+/**
+ * Transcript append route.
+ *
+ * Changes:
+ * - Embedding computation moved to after() — never blocks the response.
+ * - Missing GEMINI_API_KEY no longer returns 500; chunk is inserted without embedding.
+ * - Returns JSON on every error path.
+ */
+
 import { auth } from "@clerk/nextjs/server";
 import { and, eq } from "drizzle-orm";
 import { ZodError } from "zod";
+import { after } from "next/server";
 import { db } from "@/src/db/index";
 import { interviews, transcriptChunks } from "@/src/db/schema";
 import { embedText } from "@/src/lib/gemini-embeddings";
 import { AppendTranscriptSchema } from "@/src/schemas/transcript";
-import "@/src/lib/config";
 
 export async function POST(request: Request) {
   try {
-    const geminiApiKey = process.env.GEMINI_API_KEY;
-    if (!geminiApiKey) {
-      console.error(
-        "❌ CRITICAL: GEMINI_API_KEY is missing from environment variables",
-      );
-      return Response.json(
-        { error: "GEMINI_API_KEY is missing from environment variables" },
-        { status: 500 },
-      );
-    }
-
     const { userId } = await auth();
     if (!userId) {
-      return Response.json({ error: "Unauthorized" }, { status: 401 });
+      return Response.json({ error: "Unauthorized", code: "AUTH_REQUIRED" }, { status: 401 });
     }
 
     const body = AppendTranscriptSchema.parse(await request.json());
@@ -36,48 +34,52 @@ export async function POST(request: Request) {
       .limit(1);
 
     if (!interview) {
-      return Response.json({ error: "Interview not found" }, { status: 404 });
+      return Response.json({ error: "Interview not found", code: "NOT_FOUND" }, { status: 404 });
     }
 
-    const embeddingValues = await embedText(body.content);
-
+    // Insert chunk WITHOUT embedding — fast path for the live turn
     const [chunk] = await db
       .insert(transcriptChunks)
       .values({
         interviewId: body.interviewId,
         content: body.content,
         speaker: body.speaker,
-        embedding: embeddingValues,
+        // embedding will be backfilled asynchronously below
       })
       .returning();
+
+    // Fire-and-forget: compute embedding and update the row after response is sent
+    after(async () => {
+      try {
+        const values = await embedText(body.content);
+        await db
+          .update(transcriptChunks)
+          .set({ embedding: values })
+          .where(eq(transcriptChunks.id, chunk.id));
+      } catch (embErr) {
+        // Log but never surface — RAG will simply skip un-embedded chunks
+        console.error(
+          `[TRANSCRIPT] Embedding failed for chunk ${chunk.id}:`,
+          embErr instanceof Error ? embErr.message : embErr,
+        );
+      }
+    });
 
     return Response.json(chunk);
   } catch (error) {
     if (error instanceof ZodError) {
       return Response.json(
-        {
-          error: "Invalid transcript payload",
-          details: error.flatten(),
-        },
+        { error: "Invalid transcript payload", code: "VALIDATION_ERROR", details: error.flatten() },
         { status: 422 },
       );
     }
 
-    if (
-      error instanceof Error &&
-      error.message === "GEMINI_API_KEY is not configured"
-    ) {
-      return Response.json(
-        { error: "Embedding service is not configured" },
-        { status: 503 },
-      );
-    }
-
-    console.error("Append transcript error:", error);
+    console.error("[TRANSCRIPT APPEND] Error:", error);
     return Response.json(
-      { 
-        error: "Failed to save your response to the transcript",
-        detail: error instanceof Error ? error.message : "Unknown error occurred while saving transcript"
+      {
+        error: "Failed to save transcript",
+        code: "INTERNAL_ERROR",
+        detail: error instanceof Error ? error.message : "Unknown error",
       },
       { status: 500 },
     );

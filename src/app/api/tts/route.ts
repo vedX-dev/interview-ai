@@ -1,22 +1,111 @@
+/**
+ * TTS proxy route (Sarvam Bulbul v3).
+ *
+ * Phase C improvements:
+ * - Strip markdown, code blocks, URLs, emojis before synthesis
+ * - Hash-based cache key (sha256 of text+voice) — safe for large inputs
+ * - Per-user daily character budget (tracked in memory, reset midnight UTC)
+ * - Global daily character budget cap
+ * - Fallback to browser SpeechSynthesis with { fallback: true } signal
+ * - Returns JSON on every error path
+ */
+
 import { auth } from "@clerk/nextjs/server";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import "@/src/lib/config";
+import { createHash } from "crypto";
 
-// In-Memory cache for synthesized audio (text -> base64 audio array)
-const ttsCache = new Map<string, string[]>();
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-// Simple server-wide budget tracker
-let totalCharsSynthesized = 0;
-const MAX_SESSION_CHARS = 20000; // Budget cap: 20k characters
+const SARVAM_API = "https://api.sarvam.ai/text-to-speech";
+const MAX_CHUNK_CHARS = 400;         // Sarvam Bulbul v3 safe limit
+const MAX_TEXT_CHARS = 2000;         // Per-request input cap
+const GLOBAL_DAILY_CHARS = 200_000; // ~400 interview turns/day globally
+const USER_DAILY_CHARS = 5_000;     // Per-user daily budget
+const CACHE_MAX_ENTRIES = 500;
+
+// ─── Zod schema ───────────────────────────────────────────────────────────────
 
 const TTSRequestSchema = z.object({
-  text: z.string().min(1).max(2500),
+  text: z.string().min(1).max(MAX_TEXT_CHARS),
   speaker: z.string().optional().default("aditya"),
 });
 
-// Helper to chunk text into < 250 char segments for optimal Sarvam Bulbul v3 synthesis
-function chunkText(text: string, maxLen = 250): string[] {
+// ─── In-memory cache (hash → base64 audio chunks) ────────────────────────────
+
+const ttsCache = new Map<string, string[]>();
+
+function cacheKey(text: string, speaker: string): string {
+  return createHash("sha256")
+    .update(`${speaker}:${text}`)
+    .digest("hex");
+}
+
+// ─── Per-user and global daily budget ────────────────────────────────────────
+
+interface DailyBudget {
+  chars: number;
+  date: string; // YYYY-MM-DD UTC
+}
+
+const userBudgets = new Map<string, DailyBudget>();
+let globalBudget: DailyBudget = { chars: 0, date: todayUTC() };
+
+function todayUTC(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function checkAndDeductBudget(userId: string, charCount: number): boolean {
+  const today = todayUTC();
+
+  // Reset global budget on new day
+  if (globalBudget.date !== today) {
+    globalBudget = { chars: 0, date: today };
+  }
+  if (globalBudget.chars + charCount > GLOBAL_DAILY_CHARS) return false;
+
+  // Reset per-user budget on new day
+  const ub = userBudgets.get(userId) ?? { chars: 0, date: today };
+  if (ub.date !== today) { ub.chars = 0; ub.date = today; }
+  if (ub.chars + charCount > USER_DAILY_CHARS) return false;
+
+  // Deduct
+  globalBudget.chars += charCount;
+  ub.chars += charCount;
+  userBudgets.set(userId, ub);
+  return true;
+}
+
+// ─── Text preprocessing ───────────────────────────────────────────────────────
+
+function stripForTTS(raw: string): string {
+  return raw
+    // Code fences
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/`[^`]*`/g, "")
+    // Markdown headings
+    .replace(/^#{1,6}\s+/gm, "")
+    // Bold/italic
+    .replace(/\*{1,3}([^*]+)\*{1,3}/g, "$1")
+    .replace(/_{1,3}([^_]+)_{1,3}/g, "$1")
+    // URLs
+    .replace(/https?:\/\/\S+/g, "")
+    // Markdown links
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    // Emojis (basic Unicode ranges)
+    .replace(/[\u{1F300}-\u{1FFFF}]/gu, "")
+    .replace(/[\u{2600}-\u{27BF}]/gu, "")
+    // Bullet points
+    .replace(/^[-*+]\s+/gm, "")
+    // Multiple whitespace/newlines
+    .replace(/\n{2,}/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+// ─── Chunking ─────────────────────────────────────────────────────────────────
+
+function chunkText(text: string, maxLen = MAX_CHUNK_CHARS): string[] {
   const sentences = text.split(/(?<=[.?!])\s+/);
   const chunks: string[] = [];
   let current = "";
@@ -27,7 +116,6 @@ function chunkText(text: string, maxLen = 250): string[] {
     } else {
       if (current) chunks.push(current);
       if (sentence.length > maxLen) {
-        // Sub-split very long sentences by space
         const words = sentence.split(" ");
         let wordChunk = "";
         for (const word of words) {
@@ -48,59 +136,54 @@ function chunkText(text: string, maxLen = 250): string[] {
   return chunks.length > 0 ? chunks : [text];
 }
 
+// ─── Route handler ────────────────────────────────────────────────────────────
+
 export async function POST(req: NextRequest) {
   try {
     const { userId } = await auth();
     if (!userId) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+      return NextResponse.json({ error: "Unauthorized", code: "AUTH_REQUIRED" }, { status: 401 });
     }
 
     const body = TTSRequestSchema.parse(await req.json());
-    const rawText = body.text.trim();
-    const speaker = body.speaker || "aditya";
-    const cacheKey = `${speaker}:${rawText.toLowerCase()}`;
+    const speaker = body.speaker ?? "aditya";
 
-    // 1. Check server LRU / in-memory cache
-    if (ttsCache.has(cacheKey)) {
-      console.log("[TTS PROXY] Cache HIT for:", rawText.slice(0, 40));
-      return NextResponse.json({
-        audios: ttsCache.get(cacheKey),
-        cached: true,
-        fallback: false,
-      });
+    // Strip markdown / emoji / code before TTS
+    const cleanText = stripForTTS(body.text);
+    if (!cleanText) {
+      return NextResponse.json({ fallback: true, reason: "Text empty after preprocessing" });
     }
 
-    // 2. Check budget cap
-    if (totalCharsSynthesized + rawText.length > MAX_SESSION_CHARS) {
-      console.warn(
-        `[TTS PROXY] Budget limit reached (${totalCharsSynthesized}/${MAX_SESSION_CHARS} chars). Signal client fallback.`
-      );
-      return NextResponse.json({
-        fallback: true,
-        reason: "TTS budget cap reached for session",
-      });
+    const key = cacheKey(cleanText, speaker);
+
+    // Cache hit
+    if (ttsCache.has(key)) {
+      console.log(`[TTS] Cache HIT speaker=${speaker} len=${cleanText.length}`);
+      return NextResponse.json({ audios: ttsCache.get(key), cached: true, fallback: false });
     }
 
-    const sarvamApiKey = process.env.SARVAM_API_KEY || process.env.NEXT_PUBLIC_SARVAM_API_KEY;
-    if (!sarvamApiKey) {
-      console.warn("[TTS PROXY] SARVAM_API_KEY missing. Fallback to browser TTS.");
-      return NextResponse.json({
-        fallback: true,
-        reason: "SARVAM_API_KEY not configured",
-      });
+    // Budget check
+    if (!checkAndDeductBudget(userId, cleanText.length)) {
+      console.warn(`[TTS] Budget exceeded for user=${userId} len=${cleanText.length}`);
+      return NextResponse.json({ fallback: true, reason: "Daily TTS character budget reached" });
     }
 
-    // 3. Split into optimal chunks
-    const chunks = chunkText(rawText);
-    console.log(`[TTS PROXY] Synthesizing ${chunks.length} chunk(s) via Sarvam Bulbul v3...`);
+    const sarvamKey = process.env.SARVAM_API_KEY;
+    if (!sarvamKey) {
+      console.warn("[TTS] SARVAM_API_KEY not configured");
+      return NextResponse.json({ fallback: true, reason: "TTS service not configured" });
+    }
+
+    const chunks = chunkText(cleanText);
+    console.log(`[TTS] Synthesizing ${chunks.length} chunk(s) speaker=${speaker} totalChars=${cleanText.length}`);
 
     const audioResults: string[] = [];
 
     for (const chunk of chunks) {
-      const response = await fetch("https://api.sarvam.ai/text-to-speech", {
+      const resp = await fetch(SARVAM_API, {
         method: "POST",
         headers: {
-          "api-subscription-key": sarvamApiKey,
+          "api-subscription-key": sarvamKey,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -116,49 +199,38 @@ export async function POST(req: NextRequest) {
         }),
       });
 
-      if (!response.ok) {
-        const errText = await response.text();
-        console.warn(`[TTS PROXY] Sarvam API returned status ${response.status}: ${errText}`);
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => "");
+        console.warn(`[TTS] Sarvam returned ${resp.status}: ${errText.slice(0, 120)}`);
         return NextResponse.json({
           fallback: true,
-          reason: `Sarvam API error: ${response.status}`,
+          reason: `Sarvam API error ${resp.status}`,
         });
       }
 
-      const data = await response.json();
-      if (data.audios && data.audios[0]) {
+      const data = await resp.json();
+      if (data.audios?.[0]) {
         audioResults.push(data.audios[0]);
       }
     }
 
     if (audioResults.length === 0) {
-      return NextResponse.json({
-        fallback: true,
-        reason: "No audio generated",
-      });
+      return NextResponse.json({ fallback: true, reason: "No audio generated" });
     }
 
-    // Update character usage count
-    totalCharsSynthesized += rawText.length;
-
-    // Cache the result
-    ttsCache.set(cacheKey, audioResults);
-    if (ttsCache.size > 200) {
-      // LRU eviction
+    // Store in cache with LRU eviction
+    ttsCache.set(key, audioResults);
+    if (ttsCache.size > CACHE_MAX_ENTRIES) {
       const firstKey = ttsCache.keys().next().value;
       if (firstKey) ttsCache.delete(firstKey);
     }
 
-    return NextResponse.json({
-      audios: audioResults,
-      cached: false,
-      fallback: false,
-    });
+    return NextResponse.json({ audios: audioResults, cached: false, fallback: false });
   } catch (error: any) {
-    console.error("[TTS PROXY] Unexpected error:", error);
+    console.error("[TTS] Unexpected error:", error?.message);
     return NextResponse.json({
       fallback: true,
-      reason: error.message || "Failed to process TTS request",
+      reason: error?.message ?? "Unexpected TTS error",
     });
   }
 }

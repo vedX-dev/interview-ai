@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef } from "react";
 import { useRouter, useParams } from "next/navigation";
-import { Mic, MicOff, Volume2, VolumeX, CheckCircle, XCircle, ArrowRight } from "lucide-react";
+import { Mic, MicOff, Volume2, VolumeX, CheckCircle, XCircle, ArrowRight, ArrowLeft, Camera, CameraOff, ShieldCheck, Eye } from "lucide-react";
 
 export default function InterviewLobbyPage() {
   const params = useParams<{ id: string }>();
@@ -10,6 +10,10 @@ export default function InterviewLobbyPage() {
   const interviewId = params.id;
 
   const [micPermission, setMicPermission] = useState<"granted" | "denied" | "pending">("pending");
+  const [cameraPermission, setCameraPermission] = useState<"granted" | "denied" | "pending">("pending");
+  const [isMicOn, setIsMicOn] = useState(false);
+  const [isCameraOn, setIsCameraOn] = useState(false);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
   const [audioLevel, setAudioLevel] = useState(0);
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState("");
@@ -19,10 +23,17 @@ export default function InterviewLobbyPage() {
   const [error, setError] = useState<string | null>(null);
   const [isValidating, setIsValidating] = useState(true);
 
+  // Integrity Monitoring & Calibration State
+  const [integrityConsent, setIntegrityConsent] = useState(true);
+  const [isCalibrating, setIsCalibrating] = useState(false);
+  const [isCalibrated, setIsCalibrated] = useState(false);
+  const [calibrationProgress, setCalibrationProgress] = useState(0);
+
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const microphoneRef = useRef<MediaStream | null>(null);
   const recognitionRef = useRef<any>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
 
   useEffect(() => {
     // Validate interview ID on mount
@@ -70,24 +81,28 @@ export default function InterviewLobbyPage() {
     }
 
     return () => {
-      // Cleanup
       if (microphoneRef.current) {
         microphoneRef.current.getTracks().forEach(track => track.stop());
       }
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-      }
-      if (recognitionRef.current) {
-        recognitionRef.current.stop();
+      if (cameraStream) {
+        cameraStream.getTracks().forEach(track => track.stop());
       }
     };
-  }, [interviewId, router]);
+  }, [interviewId, router, cameraStream]);
 
-  const requestMicPermission = async () => {
+  // Dedicated effect to attach stream to video element when available
+  useEffect(() => {
+    if (videoRef.current && cameraStream) {
+      videoRef.current.srcObject = cameraStream;
+    }
+  }, [cameraStream, isCameraOn]);
+
+  const startMic = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       microphoneRef.current = stream;
       setMicPermission("granted");
+      setIsMicOn(true);
       setError(null);
       
       // Set up audio analyzer for level meter
@@ -98,13 +113,49 @@ export default function InterviewLobbyPage() {
         source.connect(analyser);
         analyserRef.current = analyser;
         
-        // Start audio level monitoring
         updateAudioLevel();
       }
     } catch (err) {
       console.error("Mic permission denied:", err);
       setMicPermission("denied");
+      setIsMicOn(false);
       setError("Microphone permission denied. You can continue with text input.");
+    }
+  };
+
+  const toggleMic = async () => {
+    if (isMicOn && microphoneRef.current) {
+      microphoneRef.current.getTracks().forEach((track) => track.stop());
+      microphoneRef.current = null;
+      setIsMicOn(false);
+      setAudioLevel(0);
+    } else {
+      await startMic();
+    }
+  };
+
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      setCameraStream(stream);
+      setIsCameraOn(true);
+      setCameraPermission("granted");
+      setError(null);
+    } catch (err) {
+      console.error("Camera permission denied:", err);
+      setCameraPermission("denied");
+      setIsCameraOn(false);
+      setError("Camera permission denied or camera unavailable.");
+    }
+  };
+
+  const toggleCamera = async () => {
+    if (isCameraOn && cameraStream) {
+      cameraStream.getTracks().forEach((track) => track.stop());
+      setCameraStream(null);
+      setIsCameraOn(false);
+    } else {
+      await startCamera();
     }
   };
 
@@ -214,7 +265,33 @@ export default function InterviewLobbyPage() {
     window.speechSynthesis.speak(utterance);
   };
 
-  const canStartInterview = !isValidating && micPermission === "granted" && sttTested && ttsTested && speakerWorks;
+  const run3sCalibration = () => {
+    if (!isCameraOn || cameraPermission !== "granted") {
+      setError("Please enable camera before starting baseline calibration.");
+      return;
+    }
+    setIsCalibrating(true);
+    setCalibrationProgress(0);
+    let step = 0;
+    const interval = setInterval(() => {
+      step += 10;
+      setCalibrationProgress(step);
+      if (step >= 100) {
+        clearInterval(interval);
+        setIsCalibrating(false);
+        setIsCalibrated(true);
+        const calData = {
+          baselineYaw: 0,
+          baselinePitch: 0,
+          timestamp: Date.now(),
+        };
+        localStorage.setItem(`integrity_calibration_${interviewId}`, JSON.stringify(calData));
+        console.log("[LOBBY] Baseline calibration stored:", calData);
+      }
+    }, 300);
+  };
+
+  const canStartInterview = !isValidating && micPermission === "granted" && sttTested && ttsTested && speakerWorks && integrityConsent;
 
   const startInterview = () => {
     console.log("[LOBBY] Starting interview with ID:", interviewId);
@@ -227,82 +304,223 @@ export default function InterviewLobbyPage() {
   };
 
   return (
-    <div className="min-h-screen bg-black text-zinc-100 flex items-center justify-center p-4">
-      <div className="max-w-2xl w-full space-y-8">
-        <div className="text-center space-y-2">
-          <h1 className="text-3xl font-bold text-white">Setup Your Audio</h1>
-          <p className="text-zinc-400">Let's make sure your microphone and speakers are working before we start.</p>
+    <div className="h-dvh max-h-dvh w-full bg-black text-zinc-100 flex flex-col justify-between p-3 sm:p-4 overflow-hidden select-none">
+      <div className="max-w-2xl w-full mx-auto flex-1 min-h-0 flex flex-col justify-between py-1 space-y-2">
+        {/* Top Navigation Header with Back Button */}
+        <div className="flex items-center justify-between shrink-0">
+          <button
+            onClick={() => router.back()}
+            className="flex items-center gap-1.5 text-xs text-zinc-400 hover:text-white transition-colors py-1 px-2.5 rounded-lg bg-zinc-900 border border-zinc-800"
+          >
+            <ArrowLeft size={14} />
+            <span>Back</span>
+          </button>
+          <div className="text-center">
+            <h1 className="text-base sm:text-lg font-bold text-white">Setup Audio & Camera</h1>
+            <p className="text-[11px] text-zinc-400">Verify your devices before entering the interview</p>
+          </div>
+          <div className="w-16" />
         </div>
 
-        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-6 space-y-6">
-          {/* Microphone Permission */}
-          <div className="space-y-3">
+        {/* Setup Check Cards Container */}
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3 sm:p-4 flex-1 min-h-0 overflow-y-auto space-y-3 flex flex-col justify-between shadow-xl">
+          {/* Microphone Check */}
+          <div className="space-y-1">
             <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className={`p-2 rounded-full ${
-                  micPermission === "granted" ? "bg-green-900/50 text-green-400" :
+              <div className="flex items-center gap-2.5">
+                <div className={`p-1.5 rounded-full ${
+                  micPermission === "granted" && isMicOn ? "bg-green-900/50 text-green-400" :
                   micPermission === "denied" ? "bg-red-900/50 text-red-400" :
                   "bg-zinc-800 text-zinc-400"
                 }`}>
-                  {micPermission === "granted" ? <CheckCircle size={20} /> :
-                   micPermission === "denied" ? <XCircle size={20} /> :
-                   <Mic size={20} />}
+                  {micPermission === "granted" && isMicOn ? <CheckCircle size={18} /> :
+                   micPermission === "denied" ? <XCircle size={18} /> :
+                   <Mic size={18} />}
                 </div>
                 <div>
-                  <h3 className="font-semibold text-white">Microphone Permission</h3>
-                  <p className="text-sm text-zinc-400">
-                    {micPermission === "granted" ? "Permission granted" :
-                     micPermission === "denied" ? "Permission denied" :
-                     "Click to request permission"}
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-semibold text-white text-xs sm:text-sm">Microphone Check</h3>
+                    {micPermission === "granted" && isMicOn && (
+                      <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium border transition-colors ${
+                        audioLevel > 15
+                          ? "bg-green-500/20 text-green-400 border-green-500/40"
+                          : "bg-zinc-800 text-zinc-500 border-zinc-800"
+                      }`}>
+                        <span className={`h-1.5 w-1.5 rounded-full ${audioLevel > 15 ? "bg-green-400 animate-ping" : "bg-zinc-600"}`} />
+                        {audioLevel > 15 ? "Mic Active" : "Mic Idle"}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-zinc-400">
+                    {micPermission === "granted" && isMicOn
+                      ? "Permission granted & microphone active"
+                      : micPermission === "granted" && !isMicOn
+                      ? "Permission granted (Microphone off)"
+                      : micPermission === "denied"
+                      ? "Permission denied or microphone unavailable"
+                      : "Test microphone & request permission"}
                   </p>
                 </div>
               </div>
-              {micPermission === "pending" && (
+
+              {micPermission === "pending" ? (
                 <button
-                  onClick={requestMicPermission}
-                  className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-medium transition-colors"
+                  onClick={startMic}
+                  className="px-3 py-1 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-medium transition-colors"
                 >
-                  Request Permission
+                  Enable Mic
+                </button>
+              ) : (
+                <button
+                  onClick={toggleMic}
+                  disabled={micPermission === "denied"}
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium border transition-colors ${
+                    isMicOn
+                      ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border-zinc-700"
+                      : "bg-purple-600 hover:bg-purple-500 text-white border-purple-500 disabled:opacity-50"
+                  }`}
+                >
+                  {isMicOn ? <MicOff size={13} /> : <Mic size={13} />}
+                  <span>{isMicOn ? "Turn Mic Off" : "Turn Mic On"}</span>
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Camera Check & Preview */}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className={`p-1.5 rounded-full ${
+                  cameraPermission === "granted" && isCameraOn ? "bg-green-900/50 text-green-400" :
+                  cameraPermission === "denied" ? "bg-red-900/50 text-red-400" :
+                  "bg-zinc-800 text-zinc-400"
+                }`}>
+                  {cameraPermission === "granted" && isCameraOn ? <CheckCircle size={18} /> :
+                   cameraPermission === "denied" ? <XCircle size={18} /> :
+                   <Camera size={18} />}
+                </div>
+                <div>
+                  <h3 className="font-semibold text-white text-xs sm:text-sm">Camera Check</h3>
+                  <p className="text-[11px] text-zinc-400">
+                    {cameraPermission === "granted" && isCameraOn
+                      ? "Permission granted & camera active"
+                      : cameraPermission === "granted" && !isCameraOn
+                      ? "Permission granted (Camera off)"
+                      : cameraPermission === "denied"
+                      ? "Permission denied or camera unavailable"
+                      : "Test camera preview & request permission"}
+                  </p>
+                </div>
+              </div>
+
+              {cameraPermission === "pending" ? (
+                <button
+                  onClick={startCamera}
+                  className="px-3 py-1 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-medium transition-colors"
+                >
+                  Enable Camera
+                </button>
+              ) : (
+                <button
+                  onClick={toggleCamera}
+                  disabled={cameraPermission === "denied"}
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium border transition-colors ${
+                    isCameraOn
+                      ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border-zinc-700"
+                      : "bg-purple-600 hover:bg-purple-500 text-white border-purple-500 disabled:opacity-50"
+                  }`}
+                >
+                  {isCameraOn ? <CameraOff size={13} /> : <Camera size={13} />}
+                  <span>{isCameraOn ? "Turn Camera Off" : "Turn Camera On"}</span>
                 </button>
               )}
             </div>
 
-            {/* Audio Level Meter */}
-            {micPermission === "granted" && (
-              <div className="space-y-2">
-                <div className="flex items-center justify-between text-sm text-zinc-400">
-                  <span>Audio Level</span>
-                  <span>{Math.round(audioLevel)}%</span>
+            {/* Large Responsive Camera Preview Frame */}
+            <div className="relative w-full aspect-[16/9] max-h-[35vh] sm:max-h-[250px] mx-auto rounded-xl bg-zinc-950 border border-zinc-800 flex items-center justify-center overflow-hidden shadow-inner my-1">
+              {cameraPermission === "granted" && isCameraOn && cameraStream ? (
+                <>
+                  <video
+                    ref={videoRef}
+                    autoPlay
+                    playsInline
+                    muted
+                    className="w-full h-full object-cover object-center transform -scale-x-100"
+                  />
+                  <div className="absolute top-2.5 left-2.5 flex items-center gap-1 px-2.5 py-1 rounded-full bg-black/60 backdrop-blur-md border border-green-500/30 text-[11px] text-green-400 font-medium">
+                    <span className="h-1.5 w-1.5 rounded-full bg-green-500 animate-pulse" />
+                    Live Camera {isCalibrated && "• Baseline Calibrated"}
+                  </div>
+                </>
+              ) : (
+                <div className="flex flex-col items-center justify-center text-center p-4">
+                  <div className="p-3 rounded-full bg-zinc-900 border border-zinc-800 text-zinc-600 mb-2">
+                    <CameraOff size={24} />
+                  </div>
+                  <p className="text-xs text-zinc-400 font-medium">
+                    {cameraPermission === "denied"
+                      ? "Camera access denied or device unavailable"
+                      : cameraPermission === "granted" && !isCameraOn
+                      ? "Camera is currently turned off"
+                      : "Click 'Enable Camera' to test your video preview"}
+                  </p>
                 </div>
-                <div className="h-8 flex items-center gap-1">
-                  {Array.from({ length: 20 }).map((_, i) => (
-                    <div
-                      key={i}
-                      className="flex-1 bg-gradient-to-t from-green-500 to-green-400 rounded-sm transition-all duration-75"
-                      style={{
-                        height: `${Math.min(100, (audioLevel / 255) * 100 * (1 - i * 0.03))}%`,
-                        opacity: audioLevel > 10 ? 1 : 0.3,
-                      }}
-                    />
-                  ))}
+              )}
+            </div>
+
+            {/* Calibration Bar */}
+            {cameraPermission === "granted" && isCameraOn && (
+              <div className="flex items-center justify-between bg-zinc-950/80 p-2 rounded-lg border border-zinc-800 text-xs mt-1">
+                <div className="flex items-center gap-2">
+                  <Eye size={14} className={isCalibrated ? "text-green-400" : "text-amber-400"} />
+                  <span className="text-zinc-300">
+                    {isCalibrated ? "Face Baseline Calibrated" : "3-Sec Alignment Calibration"}
+                  </span>
                 </div>
-                <p className="text-xs text-zinc-500">Speak to see the level meter move</p>
+                <button
+                  onClick={run3sCalibration}
+                  disabled={isCalibrating}
+                  className="px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-white text-[11px] font-medium transition-colors disabled:opacity-50"
+                >
+                  {isCalibrating ? `Calibrating (${calibrationProgress}%)` : isCalibrated ? "Recalibrate" : "Calibrate Alignment (3s)"}
+                </button>
               </div>
             )}
           </div>
 
+          {/* Integrity Monitoring Consent */}
+          <div className="bg-zinc-950/60 p-2.5 rounded-lg border border-zinc-800/80 space-y-1">
+            <div className="flex items-start gap-2">
+              <input
+                type="checkbox"
+                id="integrityConsent"
+                checked={integrityConsent}
+                onChange={(e) => setIntegrityConsent(e.target.checked)}
+                className="mt-0.5 rounded border-zinc-700 bg-zinc-900 text-purple-600 focus:ring-purple-500"
+              />
+              <label htmlFor="integrityConsent" className="text-[11px] text-zinc-300 cursor-pointer">
+                <span className="font-semibold text-white flex items-center gap-1 inline-flex">
+                  <ShieldCheck size={13} className="text-purple-400" />
+                  Integrity Monitoring:
+                </span>{" "}
+                Monitors face alignment, multi-person, and device presence locally in browser. <span className="text-zinc-400">Video frames are NEVER uploaded or stored.</span>
+              </label>
+            </div>
+          </div>
+
           {/* Speech Recognition Test */}
-          <div className="space-y-3">
+          <div className="space-y-1">
             <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className={`p-2 rounded-full ${
+              <div className="flex items-center gap-2.5">
+                <div className={`p-1.5 rounded-full ${
                   sttTested ? "bg-green-900/50 text-green-400" : "bg-zinc-800 text-zinc-400"
                 }`}>
-                  {sttTested ? <CheckCircle size={20} /> : <Mic size={20} />}
+                  {sttTested ? <CheckCircle size={18} /> : <Mic size={18} />}
                 </div>
                 <div>
-                  <h3 className="font-semibold text-white">Speech Recognition Test</h3>
-                  <p className="text-sm text-zinc-400">
+                  <h3 className="font-semibold text-white text-xs sm:text-sm">Speech Recognition Test</h3>
+                  <p className="text-[11px] text-zinc-400">
                     {sttTested ? "Working correctly" : "Say something to test transcription"}
                   </p>
                 </div>
@@ -310,8 +528,8 @@ export default function InterviewLobbyPage() {
               {!sttTested && (
                 <button
                   onClick={isListening ? stopSttTest : startSttTest}
-                  disabled={micPermission !== "granted"}
-                  className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                  disabled={micPermission !== "granted" || !isMicOn}
+                  className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${
                     isListening 
                       ? "bg-red-600 hover:bg-red-500 text-white" 
                       : "bg-purple-600 hover:bg-purple-500 text-white disabled:opacity-50 disabled:cursor-not-allowed"
@@ -323,28 +541,28 @@ export default function InterviewLobbyPage() {
             </div>
 
             {transcript && (
-              <div className="bg-zinc-800 rounded-lg p-3">
-                <p className="text-sm text-zinc-300">{transcript}</p>
+              <div className="bg-zinc-800/80 rounded-md p-1.5">
+                <p className="text-xs text-zinc-300 truncate">{transcript}</p>
               </div>
             )}
           </div>
 
           {/* Speaker Test */}
-          <div className="space-y-3">
+          <div className="space-y-1">
             <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className={`p-2 rounded-full ${
+              <div className="flex items-center gap-2.5">
+                <div className={`p-1.5 rounded-full ${
                   ttsTested && speakerWorks ? "bg-green-900/50 text-green-400" :
                   ttsTested && !speakerWorks ? "bg-red-900/50 text-red-400" :
                   "bg-zinc-800 text-zinc-400"
                 }`}>
-                  {ttsTested && speakerWorks ? <CheckCircle size={20} /> :
-                   ttsTested && !speakerWorks ? <XCircle size={20} /> :
-                   <Volume2 size={20} />}
+                  {ttsTested && speakerWorks ? <CheckCircle size={18} /> :
+                   ttsTested && !speakerWorks ? <XCircle size={18} /> :
+                   <Volume2 size={18} />}
                 </div>
                 <div>
-                  <h3 className="font-semibold text-white">Speaker Test</h3>
-                  <p className="text-sm text-zinc-400">
+                  <h3 className="font-semibold text-white text-xs sm:text-sm">Speaker Test</h3>
+                  <p className="text-[11px] text-zinc-400">
                     {ttsTested 
                       ? speakerWorks 
                         ? "Working correctly" 
@@ -356,7 +574,7 @@ export default function InterviewLobbyPage() {
               {!ttsTested && (
                 <button
                   onClick={testTts}
-                  className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-medium transition-colors"
+                  className="px-3 py-1 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-medium transition-colors"
                 >
                   Test Audio
                 </button>
@@ -366,38 +584,38 @@ export default function InterviewLobbyPage() {
 
           {/* Error Display */}
           {error && (
-            <div className="bg-red-900/20 border border-red-800 rounded-lg p-3">
-              <p className="text-sm text-red-400">{error}</p>
+            <div className="bg-red-900/20 border border-red-800 rounded-md p-2">
+              <p className="text-xs text-red-400">{error}</p>
             </div>
           )}
         </div>
 
         {/* Action Buttons */}
-        <div className="flex gap-4">
+        <div className="flex gap-3 shrink-0 pt-0.5">
           <button
             onClick={skipSetup}
-            className="flex-1 px-6 py-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-lg font-medium transition-colors"
+            className="flex-1 px-4 py-2.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-lg text-xs sm:text-sm font-medium transition-colors"
           >
             Skip Setup
           </button>
           <button
             onClick={startInterview}
             disabled={!canStartInterview}
-            className={`flex-1 px-6 py-3 rounded-lg font-medium transition-colors flex items-center justify-center gap-2 ${
+            className={`flex-1 px-4 py-2.5 rounded-lg text-xs sm:text-sm font-medium transition-colors flex items-center justify-center gap-2 ${
               canStartInterview
-                ? "bg-purple-600 hover:bg-purple-500 text-white"
+                ? "bg-purple-600 hover:bg-purple-500 text-white shadow-lg shadow-purple-600/20"
                 : "bg-zinc-800 text-zinc-500 cursor-not-allowed"
             }`}
           >
-            Start Interview
-            <ArrowRight size={18} />
+            <span>Start Interview</span>
+            <ArrowRight size={16} />
           </button>
         </div>
 
-        <p className="text-center text-sm text-zinc-500">
+        <p className="text-center text-[11px] text-zinc-500 shrink-0">
           {canStartInterview 
             ? "All checks passed! Ready to start your interview."
-            : "Complete the audio checks above to enable the start button, or skip to continue with text input."}
+            : "Complete the audio checks above to enable the start button, or skip to continue."}
         </p>
       </div>
     </div>

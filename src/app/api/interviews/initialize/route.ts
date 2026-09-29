@@ -1,15 +1,26 @@
+/**
+ * POST /api/interviews/initialize
+ *
+ * Creates the interview row, generates coverage topics (async after response),
+ * and returns a FIXED greeting string — never LLM-generated, never repeatable.
+ *
+ * The greeting uses the candidate's FIRST name only.
+ * The client must display + speak it once, then call /api/interviews/[id]/turn
+ * for every subsequent AI response.
+ */
+
 import { auth } from "@clerk/nextjs/server";
 import { and, eq } from "drizzle-orm";
+import { after } from "next/server";
 import { NextRequest, NextResponse } from "next/server";
 import { z, ZodError } from "zod";
 import { db } from "@/src/db/index";
-import { interviews, resumes } from "@/src/db/schema";
-import {
-  DUMMY_RESUME_ID,
-  MOCK_STRUCTURED_RESUME,
-} from "@/src/lib/default-interview-plan";
+import { interviews, resumes, transcriptChunks } from "@/src/db/schema";
+import { DUMMY_RESUME_ID, MOCK_STRUCTURED_RESUME } from "@/src/lib/default-interview-plan";
 import { ExtractedResumeSchema } from "@/src/schemas/resume";
-import { checkRateLimit, checkDailyLimit } from "@/src/lib/rate-limit";
+import { ConversationStateSchema } from "@/src/schemas/brain";
+import { checkInterviewCreate } from "@/src/lib/rate-limit";
+import { generateCoverageTopics } from "@/src/lib/interview/state";
 import "@/src/lib/config";
 
 const InitializeRequestSchema = z.object({
@@ -25,26 +36,11 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // Rate limiting check
-    const rateLimitCheck = checkRateLimit(userId);
-    if (!rateLimitCheck.allowed) {
+    const rl = checkInterviewCreate(userId);
+    if (!rl.allowed) {
       return NextResponse.json(
-        { 
-          error: rateLimitCheck.reason,
-          retryAfter: rateLimitCheck.retryAfter 
-        },
-        { status: 429 },
-      );
-    }
-
-    const dailyLimitCheck = checkDailyLimit(userId);
-    if (!dailyLimitCheck.allowed) {
-      return NextResponse.json(
-        { 
-          error: dailyLimitCheck.reason,
-          retryAfter: dailyLimitCheck.retryAfter 
-        },
-        { status: 429 },
+        { error: rl.reason, code: rl.code, retryAfterSec: rl.retryAfterSec },
+        { status: 429, headers: { "Retry-After": String(rl.retryAfterSec ?? 60) } },
       );
     }
 
@@ -67,10 +63,7 @@ export async function POST(req: NextRequest) {
           candidateProfile = ExtractedResumeSchema.parse(resume.structuredData);
         }
       } catch (lookupError) {
-        console.warn(
-          "Resume lookup skipped or failed; using mock profile:",
-          lookupError,
-        );
+        console.warn("Resume lookup skipped or failed; using mock profile:", lookupError);
       }
     }
 
@@ -80,10 +73,7 @@ export async function POST(req: NextRequest) {
         try {
           await db
             .update(resumes)
-            .set({
-              fullName: candidateProfile.fullName,
-              structuredData: candidateProfile,
-            })
+            .set({ fullName: candidateProfile.fullName, structuredData: candidateProfile })
             .where(eq(resumes.id, resumeIdForDb));
         } catch (updateErr) {
           console.warn("Failed to persist updated resume to DB:", updateErr);
@@ -91,7 +81,27 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Create interview with greeting phase
+    // ── Fixed greeting (first name only, never LLM-generated) ────────────────
+    const firstName = candidateProfile.fullName
+      ? candidateProfile.fullName.split(" ")[0]
+      : "there";
+
+    const greeting =
+      `Hi ${firstName}, welcome! I'm glad you could make it today. ` +
+      `Before we begin, is there anything you'd like to check on your end — audio, video, anything like that?`;
+
+    // ── Bootstrap ConversationState ──────────────────────────────────────────
+    const initialState = ConversationStateSchema.parse({
+      phase: "intro",
+      coverage: [], // Populated in after() below to not block the response
+      asked: [],
+      scores: [],
+      followUpsOnCurrent: 0,
+      turnCount: 0,
+      firstName,
+    });
+
+    // ── Create interview row ─────────────────────────────────────────────────
     const [createdInterview] = await db
       .insert(interviews)
       .values({
@@ -100,66 +110,51 @@ export async function POST(req: NextRequest) {
         jobRole: body.jobRole,
         status: "ongoing",
         currentPhase: "greeting",
-        feedback: { candidateProfile }, // Store candidate profile for orchestrator
+        feedback: { candidateProfile },
+        plan: initialState as any,
       })
       .returning();
 
-    // Call orchestrator to generate greeting
-    let greeting = "Hi, thanks for joining. Ready to get started?";
-    try {
-      console.log("[INITIALIZE] Calling orchestrator for interview:", createdInterview.id);
-      const orchestratorResponse = await fetch(
-        `${req.nextUrl.origin}/api/interviews/${createdInterview.id}/orchestrator`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            interviewId: createdInterview.id,
-            currentPhase: "greeting",
-            transcript: [],
-            resumeData: candidateProfile,
-            jobRole: body.jobRole,
-            geminiCallsCount: 0,
-            totalTurns: 0,
-            adaptiveDecisionsCount: 0,
-          }),
-        },
-      );
+    // ── Store fixed greeting in transcript ───────────────────────────────────
+    await db.insert(transcriptChunks).values({
+      interviewId: createdInterview.id,
+      speaker: "ai",
+      content: greeting,
+    });
 
-      console.log("[INITIALIZE] Orchestrator response status:", orchestratorResponse.status);
-      
-      if (orchestratorResponse.ok) {
-        const decision = await orchestratorResponse.json();
-        greeting = decision.aiUtterance;
-        console.log("[INITIALIZE] Generated greeting via orchestrator:", greeting);
-      } else {
-        const errorText = await orchestratorResponse.text();
-        console.warn("[INITIALIZE] Orchestrator failed with status:", orchestratorResponse.status, "Error:", errorText);
+    // ── Generate topics asynchronously (non-blocking) ────────────────────────
+    after(async () => {
+      try {
+        const topics = await generateCoverageTopics(body.jobRole, candidateProfile);
+        const stateWithTopics = { ...initialState, coverage: topics };
+        await db
+          .update(interviews)
+          .set({ plan: stateWithTopics as any })
+          .where(eq(interviews.id, createdInterview.id));
+        console.log(`[INITIALIZE] Generated ${topics.length} coverage topics for ${createdInterview.id}`);
+      } catch (err) {
+        console.warn("[INITIALIZE] after(): topic generation failed:", (err as Error).message);
       }
-    } catch (orchestratorError) {
-      console.warn("[INITIALIZE] Orchestrator call failed, using default greeting:", orchestratorError);
-    }
+    });
+
+    console.log(`[INITIALIZE] Interview created: ${createdInterview.id} role=${body.jobRole} candidate=${firstName}`);
 
     return NextResponse.json({
       ...createdInterview,
-      greeting, // Include greeting for the lobby to use
+      greeting,
     });
   } catch (error) {
     if (error instanceof ZodError) {
       return NextResponse.json(
-        {
-          error: "Request did not match the expected schema",
-          details: error.flatten(),
-        },
+        { error: "Request did not match the expected schema", details: error.flatten() },
         { status: 422 },
       );
     }
-
     console.error("Initialize interview error:", error);
     return NextResponse.json(
-      { 
+      {
         error: "Failed to initialize interview session",
-        detail: error instanceof Error ? error.message : "Unknown error occurred while creating interview"
+        detail: error instanceof Error ? error.message : "Unknown error occurred",
       },
       { status: 500 },
     );

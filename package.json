@@ -14,9 +14,11 @@
   "dependencies": {
     "@clerk/nextjs": "^7.2.7",
     "@google/genai": "^2.10.0",
+    "@mediapipe/tasks-vision": "^1.0.1",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
     "lucide-react": "^1.24.0",
+    "mammoth": "^1.13.0",
     "next": "16.2.4",
     "pdf-parse": "^2.4.5",
     "pdfjs-dist": "^6.1.200",
@@ -24,6 +26,7 @@
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "sarvamai": "^1.1.7",
+    "unpdf": "^1.8.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {

@@ -1,11 +1,12 @@
 "use client";
 
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  DUMMY_RESUME_ID,
-  MOCK_STRUCTURED_RESUME,
-} from "@/src/lib/default-interview-plan";
+import { ShieldAlert, ShieldCheck } from "lucide-react";
+import { IntegrityDetector } from "@/src/lib/integrity/detector";
+import { INTEGRITY_CONFIG } from "@/src/lib/integrity/config";
+import type { IntegrityEvent } from "@/src/schemas/integrity";
+import { MOCK_STRUCTURED_RESUME } from "@/src/lib/default-interview-plan";
 
 type TurnState = "idle" | "ai_speaking" | "user_turn" | "processing";
 
@@ -50,11 +51,31 @@ type InterviewRecord = {
   };
 };
 
-type OrchestratorDecision = {
-  phase: "greeting" | "rapport" | "technical" | "wrapup" | "closed";
-  aiUtterance: string;
-  phaseComplete: boolean;
-  reasoning?: string;
+type TurnResponse = {
+  say: string;
+  phase: "intro" | "warmup" | "core" | "wrapup" | "closing";
+  isComplete: boolean;
+  _dev?: {
+    evaluation?: Record<string, unknown>;
+    decision?: Record<string, unknown>;
+    provider: string;
+    latencyMs: number;
+    action: string;
+  };
+};
+
+// Phase display mapping (server 5-phase → UI label)
+const PHASE_LABELS: Record<string, string> = {
+  intro: "Getting Started",
+  warmup: "Getting to Know You",
+  core: "Technical Round",
+  wrapup: "Wrapping Up",
+  closing: "Complete",
+  // legacy DB phases (if loaded from old rows)
+  greeting: "Getting Started",
+  rapport: "Getting to Know You",
+  technical: "Technical Round",
+  closed: "Complete",
 };
 
 type ChatMessage = {
@@ -104,13 +125,11 @@ export default function InterviewRoomPage() {
   const [interimTranscript, setInterimTranscript] = useState("");
   const [useFallbackInput, setUseFallbackInput] = useState(false);
   
-  // Orchestrator state
+  // Interview brain state (server-owned: phase, turns)
   const [isAiThinking, setIsAiThinking] = useState(false);
-  const [aiProvider, setAiProvider] = useState<"gemini" | "groq" | "fallback">("gemini");
-  const [isSwitchingProvider, setIsSwitchingProvider] = useState(false);
+  const [aiProvider, setAiProvider] = useState<string>("gemini");
   const [ttsProvider, setTtsProvider] = useState<"browser" | "sarvam">("sarvam");
-  const [currentPhase, setCurrentPhase] = useState<"greeting" | "rapport" | "technical" | "wrapup" | "closed">("greeting");
-  const [totalTurns, setTotalTurns] = useState(0);
+  const [currentPhase, setCurrentPhase] = useState<string>("intro");
   const [candidateProfile, setCandidateProfile] = useState<any>(null);
   
   const recognitionRef = useRef<any>(null);
@@ -130,6 +149,14 @@ export default function InterviewRoomPage() {
   const [ragQuery, setRagQuery] = useState("");
   const [isQueryingRag, setIsQueryingRag] = useState(false);
 
+  // Integrity monitoring state
+  const [integrityStrikes, setIntegrityStrikes] = useState(0);
+  const [integrityWarning, setIntegrityWarning] = useState<string | null>(null);
+  const [isTerminatedByIntegrity, setIsTerminatedByIntegrity] = useState(false);
+  const [showDevOverlay, setShowDevOverlay] = useState(false);
+  const [integrityDebug, setIntegrityDebug] = useState<{ yaw: number; pitch: number; gazeAway: boolean; faceCount: number; detectedObjects: string[] } | null>(null);
+  const integrityDetectorRef = useRef<IntegrityDetector | null>(null);
+
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const isAttemptingOrchestratorRef = useRef(false);
@@ -142,44 +169,34 @@ export default function InterviewRoomPage() {
     return () => clearInterval(timer);
   }, []);
 
-  // Candidate webcam stream effect (getUserMedia)
+  // ── Camera: acquire stream once on mount ────────────────────────────────────
   useEffect(() => {
     let isMounted = true;
-    let activeStream: MediaStream | null = null;
+    let acquiredStream: MediaStream | null = null;
 
     const startWebcam = async () => {
-      if (!isCameraOn) {
-        if (mediaStream) {
-          mediaStream.getTracks().forEach((track) => track.stop());
-          setMediaStream(null);
-        }
-        return;
-      }
-
       try {
         setCameraError(null);
         const stream = await navigator.mediaDevices.getUserMedia({
           video: { width: { ideal: 1280 }, height: { ideal: 720 } },
           audio: false,
         });
-
         if (!isMounted) {
-          stream.getTracks().forEach((track) => track.stop());
+          stream.getTracks().forEach((t) => t.stop());
           return;
         }
-
-        activeStream = stream;
+        acquiredStream = stream;
         setMediaStream(stream);
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
+        // srcObject is set in the dedicated effect below
       } catch (err: any) {
-        console.warn("[WEBCAM] getUserMedia failed or permission denied:", err);
-        if (isMounted) {
-          setCameraError(err.message || "Camera access denied");
-          setIsCameraOn(false);
-          setMediaStream(null);
-        }
+        if (!isMounted) return;
+        console.warn("[WEBCAM] getUserMedia error:", err);
+        let msg = "Camera access denied";
+        if (err?.name === "NotAllowedError") msg = "Camera permission denied. Click the camera icon in your browser's address bar to allow access.";
+        else if (err?.name === "NotFoundError") msg = "No camera found. Please connect a camera and refresh.";
+        else if (err?.name === "NotReadableError") msg = "Camera is in use by another application. Please close it and try again.";
+        setCameraError(msg);
+        setIsCameraOn(false);
       }
     };
 
@@ -187,11 +204,153 @@ export default function InterviewRoomPage() {
 
     return () => {
       isMounted = false;
-      if (activeStream) {
-        activeStream.getTracks().forEach((track) => track.stop());
+      if (acquiredStream) {
+        acquiredStream.getTracks().forEach((t) => t.stop());
       }
     };
-  }, [isCameraOn]);
+  // Only run once on mount — not when isCameraOn toggles
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Camera: attach srcObject AFTER the video element mounts ─────────────────
+  useEffect(() => {
+    if (videoRef.current && mediaStream) {
+      videoRef.current.srcObject = mediaStream;
+      videoRef.current.play().catch((e) =>
+        console.warn("[WEBCAM] play() failed:", e),
+      );
+    }
+  }, [mediaStream]);
+
+  // ── Integrity Monitoring: Start detector ────────────────────────────────────
+  useEffect(() => {
+    if (!videoRef.current || !mediaStream || !interviewId) return;
+
+    let detector: IntegrityDetector | null = null;
+
+    const startDetector = async () => {
+      detector = new IntegrityDetector({
+        onViolation: async (event: IntegrityEvent) => {
+          console.warn("[INTEGRITY_VIOLATION]", event);
+          try {
+            // Client-side dedup: suppress same event type within 2s
+            const dedupKey = `integrity_dedup_${event.type}`;
+            const lastSent = parseInt(sessionStorage.getItem(dedupKey) ?? "0", 10);
+            if (Date.now() - lastSent < 2000) {
+              console.log("[INTEGRITY] Client dedup suppressed:", event.type);
+              return;
+            }
+            sessionStorage.setItem(dedupKey, String(Date.now()));
+
+            // Queue to sessionStorage for resilience across retries
+            const queueKey = `integrity_queue_${interviewId}`;
+            const queue: IntegrityEvent[] = JSON.parse(sessionStorage.getItem(queueKey) ?? "[]");
+            queue.push(event);
+            sessionStorage.setItem(queueKey, JSON.stringify(queue));
+
+            // Retry loop: up to 3 attempts with exponential backoff
+            let res: Response | null = null;
+            for (let attempt = 0; attempt < 3; attempt++) {
+              if (attempt > 0) await new Promise((r) => setTimeout(r, 1000 * attempt));
+              try {
+                res = await fetch(`/api/interviews/${interviewId}/integrity`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(event),
+                });
+                if (res.status === 429) {
+                  const rd = await res.json().catch(() => ({})) as { retryAfterSec?: number };
+                  const wait = (rd.retryAfterSec ?? 10) * 1000;
+                  console.warn(`[INTEGRITY] 429, backing off ${wait}ms`);
+                  await new Promise((r) => setTimeout(r, wait));
+                  continue;
+                }
+                break;
+              } catch {
+                continue; // network error — retry
+              }
+            }
+
+            if (res?.ok) {
+              // Remove from queue on success
+              const remaining: IntegrityEvent[] = JSON.parse(sessionStorage.getItem(queueKey) ?? "[]")
+                .filter((e: IntegrityEvent) => !(e.type === event.type && e.timestamp === event.timestamp));
+              sessionStorage.setItem(queueKey, JSON.stringify(remaining));
+
+              const data = await res.json();
+              if (data.success && !data.deduplicated) {
+                setIntegrityStrikes(data.strikeNumber);
+                setIntegrityWarning(
+                  `⚠️ Integrity Warning: Sustained ${event.type.replace("_", " ").toUpperCase()} detected (${data.strikeNumber}/${INTEGRITY_CONFIG.maxStrikes} strikes)`
+                );
+                if (typeof window !== "undefined" && window.speechSynthesis) {
+                  const warnAudio = new SpeechSynthesisUtterance("Notice: Please keep your eyes on the screen during the interview.");
+                  window.speechSynthesis.speak(warnAudio);
+                }
+                if (data.isTerminated) {
+                  setIsTerminatedByIntegrity(true);
+                  setCurrentPhase("closed");
+                  setTimeout(() => { router.push(`/interview/${interviewId}/feedback`); }, 3500);
+                } else {
+                  setTimeout(() => { setIntegrityWarning(null); }, 6000);
+                }
+              }
+            } else {
+              console.warn("[INTEGRITY] Event queued (will retry on next violation):", event.type);
+            }
+          } catch (err) {
+            console.error("[INTEGRITY_API_ERROR]", err);
+          }
+        },
+        onDebugFrame: (data) => {
+          setIntegrityDebug(data);
+        },
+      });
+
+      const initialized = await detector.initialize();
+      if (initialized && videoRef.current) {
+        const calStr = localStorage.getItem(`integrity_calibration_${interviewId}`);
+        if (calStr) {
+          try {
+            detector.setBaseline(JSON.parse(calStr));
+          } catch (e) {}
+        }
+        detector.start(videoRef.current);
+        integrityDetectorRef.current = detector;
+      }
+    };
+
+    startDetector();
+
+    return () => {
+      detector?.stop();
+    };
+  }, [interviewId, mediaStream, router]);
+
+  useEffect(() => {
+    integrityDetectorRef.current?.setAiSpeaking(turnState === "ai_speaking");
+  }, [turnState]);
+
+  // Prevent accidental navigation/refresh mid-interview
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (currentPhase !== "closed" && currentPhase !== "closing") {
+        e.preventDefault();
+        e.returnValue = "An interview is currently in progress. Are you sure you want to leave?";
+        return e.returnValue;
+      }
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [currentPhase]);
+
+  // ── Camera: toggle tracks enabled without stopping (instant on/off) ──────────
+  useEffect(() => {
+    if (!mediaStream) return;
+    mediaStream.getVideoTracks().forEach((t) => {
+      t.enabled = isCameraOn;
+    });
+  }, [isCameraOn, mediaStream]);
 
   // Auto-scroll transcript
   useEffect(() => {
@@ -432,112 +591,89 @@ export default function InterviewRoomPage() {
     }
   };
 
-  const callOrchestrator = useCallback(async () => {
-    console.log("[ORCHESTRATOR CALL] Interview ID being used:", interviewId);
-    console.log("[ORCHESTRATOR CALL] Current totalTurns state:", totalTurns);
-    console.log("[ORCHESTRATOR CALL] candidateProfile:", candidateProfile);
-    
+  /**
+   * callTurn: post the user's latest utterance + last-N transcript to /api/interviews/[id]/turn.
+   * Receives explicit `userUtterance` + `updatedTranscript` to avoid stale closure bugs.
+   */
+  const callTurn = useCallback(async (
+    userUtterance: string,
+    updatedTranscript: TranscriptEntry[],
+    customRequestId?: string,
+  ) => {
     if (!interviewId) return;
-
-    // Guard against multiple simultaneous calls
     if (isAttemptingOrchestratorRef.current) {
-      console.log("[ORCHESTRATOR CALL] Already attempting orchestrator, skipping duplicate call");
+      console.log("[TURN] Already in flight, skipping duplicate");
       return;
     }
 
     isAttemptingOrchestratorRef.current = true;
-    console.log("[ORCHESTRATOR CALL] Set attempting flag to true");
-
     setIsAiThinking(true);
-    setIsSwitchingProvider(false);
-    setAiProvider("gemini"); // Reset to default
-    
-    const newTotalTurns = totalTurns + 1;
-    setTotalTurns(newTotalTurns);
 
-    console.log("[ORCHESTRATOR CALL] Calculated newTotalTurns:", newTotalTurns);
+    // Safe requestId: interviewId + transcript length + short djb2 hash (no raw utterance in logs)
+    const h = userUtterance.split('').reduce((acc, c) => (Math.imul(31, acc) + c.charCodeAt(0)) | 0, 0).toString(36).replace('-','').slice(-6);
+    const clientRequestId = customRequestId || `${interviewId}_t${updatedTranscript.length}_${h}`;
 
-    const payload = {
-      interviewId,
-      currentPhase,
-      transcript: transcript.map(entry => ({
-        speaker: entry.speaker,
-        content: entry.text,
-        timestamp: entry.timestamp.toISOString(),
-      })),
-      resumeData: candidateProfile || MOCK_STRUCTURED_RESUME, // Use fallback if null
-      jobRole,
-      geminiCallsCount: 0, // Will be updated by backend
-      totalTurns: newTotalTurns,
-      adaptiveDecisionsCount: 0, // Will be updated by backend
-    };
-    console.log("[ORCHESTRATOR] Payload:", payload);
+    // Build last-6-turns for context (explicit, not from stale state)
+    const recentTranscript = updatedTranscript.slice(-12).map((e) => ({
+      speaker: e.speaker,
+      content: e.text,
+    }));
+
+    const payload = { userUtterance, recentTranscript, clientRequestId };
+    console.log("[TURN] Calling /turn, reqId:", clientRequestId, "utterance:", userUtterance.slice(0, 80));
+
+    // Helper: single fetch attempt
+    const attemptFetch = async () => fetch(`/api/interviews/${interviewId}/turn`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
 
     try {
-      const response = await fetch(`/api/interviews/${interviewId}/orchestrator`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+      let response = await attemptFetch();
+      console.log("[TURN] Response status:", response.status);
 
-      console.log("[ORCHESTRATOR] Response status:", response.status);
-      
+      // If we get a 429, wait Retry-After and retry ONCE — never discard the answer
+      if (response.status === 429) {
+        const data = await response.json().catch(() => ({})) as { retryAfterSec?: number; error?: string };
+        const waitSec = data.retryAfterSec ?? 5;
+        console.warn(`[TURN] 429 — retrying in ${waitSec}s (answer preserved)`);
+        setTranscriptError(`One moment — retrying in ${waitSec}s…`);
+        await new Promise((r) => setTimeout(r, waitSec * 1000));
+        setTranscriptError(null);
+        response = await attemptFetch();
+        console.log("[TURN] Retry response status:", response.status);
+      }
+
       if (!response.ok) {
         const errorText = await response.text();
-        console.error("[ORCHESTRATOR] Error response:", errorText);
-        
-        // Check if it's a provider switch
-        if (response.headers.get("X-AI-Provider")) {
-          const provider = response.headers.get("X-AI-Provider");
-          setAiProvider(provider as "gemini" | "groq" | "fallback");
-          setIsSwitchingProvider(true);
-          setTimeout(() => setIsSwitchingProvider(false), 2000);
-        }
-        
-        throw new Error(`Orchestrator failed: ${response.status} - ${errorText}`);
+        throw new Error(`Turn failed: ${response.status} — ${errorText}`);
       }
 
-      const decision = await response.json() as OrchestratorDecision;
-      
-      // Check which provider was used
-      if (response.headers.get("X-AI-Provider")) {
-        const provider = response.headers.get("X-AI-Provider");
-        setAiProvider(provider as "gemini" | "groq" | "fallback");
-        console.log("[ORCHESTRATOR] AI provider used:", provider);
-      }
-      console.log("[ORCHESTRATOR] Decision:", decision);
-      console.log("[ORCHESTRATOR] aiUtterance field:", decision.aiUtterance);
-      
-      setCurrentPhase(decision.phase);
+      const turnResp = await response.json() as TurnResponse;
+      console.log("[TURN] Response:", turnResp);
+
+      // Update UI phase from server truth
+      setCurrentPhase(turnResp.phase);
+      if (turnResp._dev?.provider) setAiProvider(turnResp._dev.provider);
+
       setIsAiThinking(false);
 
-      if (decision.phase === "closed") {
-        // Interview complete, generate feedback
+      if (turnResp.isComplete) {
         await generateFeedback();
       } else {
-        // Prefetch TTS audio in background to minimize playback latency
-        if (decision.aiUtterance) {
-          fetch("/api/tts", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text: decision.aiUtterance, speaker: "aditya" }),
-          }).catch(() => {}); // Fire and forget prefetch
-        }
-
-        // Speak the AI's utterance
-        console.log("[ORCHESTRATOR] About to speak aiUtterance:", decision.aiUtterance);
-        await speakAiQuestion(decision.aiUtterance);
+        await speakAiQuestion(turnResp.say);
       }
     } catch (error) {
-      console.error("[ORCHESTRATOR] Error:", error);
+      console.error("[TURN] Error:", error);
       setIsAiThinking(false);
-      setTranscriptError("Failed to get AI response. Please try again.");
+      // Preserve the candidate's answer in the transcript — it's already appended
+      setTranscriptError("Couldn't reach the AI — your answer was saved. Tap to retry.");
       setTurnState("user_turn");
     } finally {
       isAttemptingOrchestratorRef.current = false;
-      console.log("[ORCHESTRATOR CALL] Reset attempting flag to false");
     }
-  }, [interviewId, currentPhase, transcript, candidateProfile, jobRole, totalTurns, speakAiQuestion]);
+  }, [interviewId, speakAiQuestion]);
 
   // Check for speech recognition support on mount
   useEffect(() => {
@@ -552,6 +688,8 @@ export default function InterviewRoomPage() {
     }
   }, []);
 
+  const hasPlayedInitialGreetingRef = useRef(false);
+
   useEffect(() => {
     if (!interviewId) return;
 
@@ -561,7 +699,6 @@ export default function InterviewRoomPage() {
       console.error("[LOAD SESSION] Invalid interview ID format:", interviewId);
       setTranscriptError("Invalid interview ID. Please start a new interview from the home page.");
       setTurnState("idle");
-      // Redirect to home after a short delay
       setTimeout(() => {
         router.push("/");
       }, 3000);
@@ -611,22 +748,44 @@ export default function InterviewRoomPage() {
         const entries = chunks.map(mapChunkToEntry);
         setTranscript(entries);
 
-        // If transcript is empty, this is a fresh interview - call orchestrator for greeting
+        // Derive state strictly from saved transcript data
         if (entries.length === 0) {
-          // Will be handled by a separate effect
-          setTurnState("processing");
+          // Empty transcript -> play greeting & wait for candidate
+          const firstName = interview?.feedback?.candidateProfile?.fullName?.split(" ")[0] || "there";
+          const defaultGreeting = `Hi ${firstName}, welcome! I'm glad you could make it today. Before we begin, is there anything you'd like to check on your end — audio, video, anything like that?`;
+          if (!hasPlayedInitialGreetingRef.current) {
+            hasPlayedInitialGreetingRef.current = true;
+            await speakAiQuestion(defaultGreeting);
+          } else {
+            setTurnState("user_turn");
+          }
           return;
         }
 
-        // If transcript exists, check if we need to continue or if interview is complete
         const lastEntry = entries[entries.length - 1];
         if (lastEntry.speaker === "ai") {
-          // AI just spoke, it's user's turn
+          // Last entry is AI -> wait for candidate turn
           setTurnState("user_turn");
+          // Play initial greeting audio on first load if it's entry 1 and hasn't played yet
+          if (entries.length === 1 && !hasPlayedInitialGreetingRef.current) {
+            hasPlayedInitialGreetingRef.current = true;
+            // Speak without re-appending to transcript since it's already in DB
+            if (ttsProvider === "sarvam") {
+              try {
+                await speakWithSarvam(lastEntry.text);
+              } catch {
+                await speakWithBrowserTTS(lastEntry.text);
+              }
+            } else {
+              await speakWithBrowserTTS(lastEntry.text);
+            }
+          }
         } else {
-          // User just spoke, need to call orchestrator for next AI response
-          // Will be handled by a separate effect
+          // Last entry is user -> generate reply once using idempotency key
           setTurnState("processing");
+          const lastUserUtterance = lastEntry.text;
+          const resumeReqId = `${interviewId}_resume_${entries.length}`;
+          void callTurn(lastUserUtterance, entries, resumeReqId);
         }
       } catch (error) {
         if (!cancelled) {
@@ -646,28 +805,10 @@ export default function InterviewRoomPage() {
     return () => {
       cancelled = true;
     };
-  }, [interviewId, router]);
+  }, [interviewId, router, callTurn, speakAiQuestion, ttsProvider]);
 
-  // Separate effect to call orchestrator when needed
-  useEffect(() => {
-    if (turnState !== "processing" || transcript.length === 0) return;
-    
-    const lastEntry = transcript[transcript.length - 1];
-    if (lastEntry.speaker === "user") {
-      // User just spoke, call orchestrator
-      console.log("[EFFECT] Calling orchestrator after user response");
-      void callOrchestrator();
-    }
-  }, [transcript, turnState, callOrchestrator]);
-
-  // Call orchestrator on first load if transcript is empty
-  useEffect(() => {
-    console.log("[EFFECT] First load check - turnState:", turnState, "transcript length:", transcript.length);
-    if (turnState === "processing" && transcript.length === 0 && interviewId) {
-      console.log("[EFFECT] Calling orchestrator for initial greeting");
-      void callOrchestrator();
-    }
-  }, [turnState, transcript.length, interviewId, callOrchestrator]);
+  // NOTE: callTurn is now called DIRECTLY from handleSpeak with explicit args.
+  // No effects fire the AI turn — this eliminates the stale-closure and re-greeting bugs.
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -770,12 +911,16 @@ export default function InterviewRoomPage() {
     setTurnState("processing");
 
     try {
-      await appendTranscript(finalText, "user");
-      // Call orchestrator for next AI response
-      await callOrchestrator();
+      // 1. Persist user utterance and get the updated entry back
+      const newEntry = await appendTranscript(finalText, "user");
+      // 2. Build updated transcript array with the NEW entry included
+      //    (React state hasn't re-rendered yet — this is the fix for the stale closure bug)
+      const updatedTranscript = [...transcript, newEntry];
+      // 3. Call /turn with the user's utterance + fresh transcript — no stale state
+      await callTurn(finalText, updatedTranscript);
     } catch (error) {
       setTranscriptError(
-        error instanceof Error 
+        error instanceof Error
           ? `Failed to send your response: ${error.message}. Please try again or use text input.`
           : "Failed to send your response. Please try again or use text input.",
       );
@@ -913,12 +1058,26 @@ export default function InterviewRoomPage() {
           </div>
           <div className="h-3 w-[1px] bg-zinc-800" />
           <div className="font-semibold text-purple-400">
-            Q {Math.min(totalTurns + 1, 5)}/5
+            {PHASE_LABELS[currentPhase] ?? currentPhase}
           </div>
         </div>
 
         {/* Right Status Pill & Provider */}
         <div className="flex items-center gap-2">
+          {/* Unobtrusive Integrity Indicator */}
+          <span
+            onClick={() => setShowDevOverlay((prev) => !prev)}
+            className={`cursor-pointer inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold border transition-colors ${
+              integrityStrikes > 0
+                ? "bg-amber-950/40 border-amber-500/50 text-amber-300"
+                : "bg-emerald-950/30 border-emerald-500/30 text-emerald-400"
+            }`}
+            title="Click to toggle dev-only vision overlay"
+          >
+            <span className={`h-2 w-2 rounded-full ${integrityStrikes > 0 ? "bg-amber-400 animate-ping" : "bg-emerald-400 animate-pulse"}`} />
+            {integrityStrikes > 0 ? `⚠️ Integrity (${integrityStrikes}/${INTEGRITY_CONFIG.maxStrikes})` : "● Integrity Active"}
+          </span>
+
           <span className="hidden sm:inline-flex text-[10px] uppercase tracking-wider font-semibold px-2 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700/50">
             {aiProvider}
           </span>
@@ -954,6 +1113,50 @@ export default function InterviewRoomPage() {
           </span>
         </div>
       </header>
+
+      {/* Integrity Warning Banner */}
+      {integrityWarning && (
+        <div className="bg-amber-500/20 border-b border-amber-500/40 px-4 py-2 text-xs text-amber-200 flex items-center justify-between z-20 shadow-md">
+          <div className="flex items-center gap-2">
+            <ShieldAlert size={16} className="text-amber-400 shrink-0" />
+            <span className="font-semibold">{integrityWarning}</span>
+          </div>
+          <button onClick={() => setIntegrityWarning(null)} className="text-amber-400 hover:text-amber-200 text-xs font-medium">
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Dev-Only Vision Overlay */}
+      {showDevOverlay && integrityDebug && (
+        <div className="fixed bottom-16 left-4 z-50 bg-black/90 border border-purple-500/50 p-3 rounded-xl backdrop-blur-md text-[11px] font-mono text-zinc-300 space-y-1 shadow-2xl">
+          <div className="font-bold text-purple-400 border-b border-zinc-800 pb-1 flex justify-between gap-4">
+            <span>Dev Vision Overlay</span>
+            <button onClick={() => setShowDevOverlay(false)} className="text-zinc-500 hover:text-zinc-300">✕</button>
+          </div>
+          <div>Head Yaw: <span className="text-white">{integrityDebug.yaw}°</span> (Max: {INTEGRITY_CONFIG.thresholds.yawMaxDegrees}°)</div>
+          <div>Head Pitch: <span className="text-white">{integrityDebug.pitch}°</span> (Max: {INTEGRITY_CONFIG.thresholds.pitchMaxDegrees}°)</div>
+          <div>Gaze Away: <span className={integrityDebug.gazeAway ? "text-amber-400 font-bold" : "text-emerald-400"}>{integrityDebug.gazeAway ? "YES" : "NO"}</span></div>
+          <div>Faces Count: <span className="text-white">{integrityDebug.faceCount}</span></div>
+          <div>Strikes Recorded: <span className="text-amber-400 font-bold">{integrityStrikes} / {INTEGRITY_CONFIG.maxStrikes}</span></div>
+        </div>
+      )}
+
+      {/* Integrity Termination Modal */}
+      {isTerminatedByIntegrity && (
+        <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex items-center justify-center p-4 select-none">
+          <div className="max-w-md w-full bg-zinc-900 border border-rose-500/40 rounded-2xl p-6 text-center space-y-4 shadow-2xl">
+            <div className="h-12 w-12 rounded-full bg-rose-500/20 text-rose-400 flex items-center justify-center mx-auto border border-rose-500/30">
+              <ShieldAlert size={28} />
+            </div>
+            <h2 className="text-xl font-bold text-white">Interview Session Ended</h2>
+            <p className="text-xs text-zinc-300">
+              Integrity warnings were recorded during this session. The interview has been ended gracefully. Your answers provided so far have been saved and evaluated.
+            </p>
+            <div className="pt-2 text-xs text-purple-400 animate-pulse font-medium">Redirecting to report overview…</div>
+          </div>
+        </div>
+      )}
 
       {transcriptError && (
         <div
@@ -1048,22 +1251,25 @@ export default function InterviewRoomPage() {
                 : ""
             }`}
           >
-            {/* Real Live Webcam Feed */}
-            {isCameraOn && mediaStream ? (
-              <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                className="absolute inset-0 h-full w-full object-cover transform -scale-x-100 rounded-2xl z-0"
-              />
-            ) : (
-              <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,_rgba(14,165,233,0.15)_0%,_transparent_70%)]" />
-            )}
+            {/* Always-mounted video element — visibility toggled to avoid srcObject race */}
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className={`absolute inset-0 h-full w-full object-cover transform -scale-x-100 rounded-2xl z-0 transition-opacity duration-300 ${
+                isCameraOn && mediaStream ? "opacity-100" : "opacity-0 pointer-events-none"
+              }`}
+            />
 
-            {/* Subtle dark gradient overlay when webcam is active for readability */}
+            {/* Gradient overlay when webcam is active */}
             {isCameraOn && mediaStream && (
               <div className="absolute inset-0 bg-gradient-to-t from-zinc-950/80 via-transparent to-zinc-950/20 z-10 pointer-events-none" />
+            )}
+
+            {/* Background gradient when camera is off */}
+            {(!isCameraOn || !mediaStream) && (
+              <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,_rgba(14,165,233,0.15)_0%,_transparent_70%)]" />
             )}
 
             {/* Avatar Placeholder when Camera is Off */}
@@ -1529,6 +1735,46 @@ export default function InterviewRoomPage() {
                 </div>
               </div>
             )}
+
+            {/* Integrity Signals (Advisory for Reviewer) */}
+            <div className="mb-6 rounded-xl bg-zinc-800/90 border border-zinc-700/60 p-4">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <ShieldCheck size={18} className="text-purple-400" />
+                  <h3 className="text-sm font-semibold text-zinc-200">Integrity Signals for Reviewer</h3>
+                </div>
+                <span className="text-[11px] px-2 py-0.5 rounded bg-zinc-700 text-zinc-300 font-mono">
+                  {feedback.integrityEvents?.length || 0} Events Logged
+                </span>
+              </div>
+
+              <div className="mb-3 p-2.5 rounded-lg bg-zinc-900/60 border border-zinc-800 text-[11px] text-zinc-400">
+                ℹ️ <span className="font-semibold text-zinc-300">Advisory Notice:</span> These integrity signals are local vision events recorded during the live session. They are advisory metrics intended for human reviewer context.
+              </div>
+
+              {feedback.integrityEvents && feedback.integrityEvents.length > 0 ? (
+                <div className="space-y-2">
+                  {feedback.integrityEvents.map((evt: any, i: number) => (
+                    <div key={i} className="flex items-start justify-between bg-zinc-900 p-2.5 rounded-lg border border-zinc-800/80 text-xs">
+                      <div className="flex items-center gap-2">
+                        <span className="h-2 w-2 rounded-full bg-amber-400 shrink-0" />
+                        <div>
+                          <span className="font-semibold text-zinc-200 uppercase tracking-wider text-[11px]">{evt.type.replace("_", " ")}</span>
+                          <p className="text-[11px] text-zinc-400">{evt.details || "Sustained anomaly detected"}</p>
+                        </div>
+                      </div>
+                      <span className="text-[10px] text-zinc-500 font-mono">
+                        {new Date(evt.timestamp).toLocaleTimeString()} ({Math.round((evt.durationMs || 0) / 1000)}s)
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-xs text-emerald-400 font-medium flex items-center gap-1.5">
+                  ✓ Clean Session: No integrity anomalies were recorded during this interview.
+                </p>
+              )}
+            </div>
 
             {/* Recommended Follow-up */}
             {feedback.recommendedFollowUp && (

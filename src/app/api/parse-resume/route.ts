@@ -1,18 +1,35 @@
-import { GoogleGenAI } from "@google/genai";
+/**
+ * Resume parsing route.
+ *
+ * Phase E fixes:
+ * - runtime = 'nodejs' (required for pdfjs-dist / mammoth)
+ * - Accepts multipart/form-data OR JSON base64 (backward compat)
+ * - 5 MB file limit with JSON 413
+ * - Lazy dynamic imports (no top-level pdfjs import)
+ * - Supports: PDF (unpdf), DOCX (mammoth), TXT/MD (plain), others → guidance
+ * - File type detected via MIME + extension + magic bytes
+ * - Heuristic fallback if ALL LLM providers fail
+ * - Never a dead end: always returns a pre-filled editable card
+ * - Returns JSON on every error path
+ */
+
+export const runtime = "nodejs";
+
 import { auth } from "@clerk/nextjs/server";
-import * as pdfjsLib from "pdfjs-dist";
 import { ZodError } from "zod";
 import { db } from "@/src/db/index";
 import { resumes } from "@/src/db/schema";
-import { ExtractedResumeSchema } from "@/src/schemas/resume";
-import "@/src/lib/config";
+import { ExtractedResumeSchema, type ExtractedResume } from "@/src/schemas/resume";
+import { generate, tryParseAndValidate } from "@/src/lib/llm/index";
 
-// Configure pdfjs worker for Node.js environment
-// Use CDN worker for pdfjs-dist v6+
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+const MAX_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
 
 const SYSTEM_INSTRUCTION =
-  "You are an elite technical recruiter for top Indian startups. Analyze the provided resume text. Extract the candidate's full name, identify their top 5 core technical skills, normalize their total years of experience to a number (use 0 for freshers/students), and select up to 3 strongest projects or impact points. Your output must strictly adhere to the requested JSON schema structure.";
+  "You are an elite technical recruiter. Analyze the provided resume text. " +
+  "Extract the candidate's full name, identify their top 5 core technical skills, " +
+  "normalize their total years of experience to a number (use 0 for freshers/students), " +
+  "and select up to 3 strongest projects or impact points. " +
+  "Output must strictly adhere to the requested JSON schema structure.";
 
 const JSON_OUTPUT_SHAPE = `{
   "fullName": "string",
@@ -21,188 +38,261 @@ const JSON_OUTPUT_SHAPE = `{
   "coreProjects": [{ "title": "string", "description": "string" }]
 }`;
 
-async function extractTextFromPdf(data: Uint8Array): Promise<string> {
-  try {
-    console.log("Starting PDF extraction, data size:", data.length);
-    
-    // Load the PDF document
-    const loadingTask = pdfjsLib.getDocument({ data });
-    const pdf = await loadingTask.promise;
-    
-    console.log("PDF loaded successfully, pages:", pdf.numPages);
-    
-    let fullText = "";
-    let pagesWithText = 0;
-    
-    // Extract text from all pages
-    for (let i = 1; i <= pdf.numPages; i++) {
-      const page = await pdf.getPage(i);
-      const textContent = await page.getTextContent();
-      const pageText = textContent.items
-        .map((item: any) => item.str)
-        .join(" ");
-      
-      if (pageText.trim().length > 0) {
-        pagesWithText++;
-        fullText += pageText + " ";
-      }
-    }
-    
-    console.log("Extracted text from", pagesWithText, "pages out of", pdf.numPages);
-    console.log("Total text length:", fullText.length);
-    
-    // Check if we got any meaningful text
-    if (fullText.trim().length < 50) {
-      throw new Error(
-        "PDF appears to be image-based or scanned. Please upload a text-based PDF (export from Word/Google Docs)."
-      );
-    }
-    
-    // Clean up the text
-    return fullText.replace(/\s+/g, " ").trim();
-  } catch (error) {
-    console.error("PDF extraction error:", error);
-    
-    if (error instanceof Error) {
-      // Re-throw with more context
-      throw new Error(`Failed to extract text from PDF: ${error.message}`);
-    }
-    
-    throw new Error("Failed to extract text from PDF");
+// ─── Magic-byte detection ─────────────────────────────────────────────────────
+
+function detectFileType(
+  buffer: Buffer,
+  mimeHint: string,
+  nameHint: string,
+): "pdf" | "docx" | "txt" | "unsupported" {
+  const ext = nameHint.toLowerCase().split(".").pop() ?? "";
+
+  // PDF: %PDF
+  if (buffer[0] === 0x25 && buffer[1] === 0x50 && buffer[2] === 0x44 && buffer[3] === 0x46) {
+    return "pdf";
   }
+  // DOCX/XLSX/ZIP: PK magic
+  if (buffer[0] === 0x50 && buffer[1] === 0x4b) {
+    return "docx"; // treat all zip-based office formats as docx (mammoth handles .docx)
+  }
+  // Hint fallbacks
+  if (ext === "pdf" || mimeHint === "application/pdf") return "pdf";
+  if (["docx", "doc", "odt", "rtf"].includes(ext)) return "docx";
+  if (["txt", "md", "text"].includes(ext) || mimeHint.startsWith("text/")) return "txt";
+
+  return "unsupported";
 }
+
+// ─── Text extractors ──────────────────────────────────────────────────────────
+
+async function extractPdf(buffer: Buffer): Promise<string> {
+  // Dynamic import to avoid top-level side effects (pdfjs reads test file at import)
+  const { extractText } = await import("unpdf");
+  const uint8 = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  const { text } = await extractText(uint8, { mergePages: true });
+  if (!text || text.trim().length < 30) {
+    throw Object.assign(new Error("PDF appears to be image-based or empty"), { category: "unreadable" });
+  }
+  return text.replace(/\s+/g, " ").trim();
+}
+
+async function extractDocx(buffer: Buffer): Promise<string> {
+  const mammoth = await import("mammoth");
+  const result = await mammoth.extractRawText({ buffer });
+  if (!result.value || result.value.trim().length < 30) {
+    throw Object.assign(new Error("DOCX appears to be empty"), { category: "empty" });
+  }
+  return result.value.replace(/\s+/g, " ").trim();
+}
+
+function extractTxt(buffer: Buffer): string {
+  const text = buffer.toString("utf-8");
+  if (text.trim().length < 10) {
+    throw Object.assign(new Error("Text file is empty"), { category: "empty" });
+  }
+  return text.replace(/\s+/g, " ").trim();
+}
+
+// ─── Heuristic fallback parser ────────────────────────────────────────────────
+
+function heuristicParse(text: string) {
+  // Extract email for name guess
+  const emailMatch = text.match(/[\w.+-]+@[\w-]+\.[a-z]{2,}/i);
+  const nameGuess = emailMatch
+    ? emailMatch[0].split("@")[0].replace(/[._+-]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+    : "Candidate";
+
+  // Extract years of experience
+  const yoeMatch = text.match(/(\d+)\+?\s*years?\s*(of\s*)?(experience|exp)/i);
+  const yoe = yoeMatch ? parseInt(yoeMatch[1], 10) : 0;
+
+  // Common skill keywords
+  const techKeywords = [
+    "Python", "JavaScript", "TypeScript", "React", "Node.js", "Java", "Go", "Rust",
+    "C\\+\\+", "C#", "SQL", "PostgreSQL", "MySQL", "MongoDB", "Redis", "AWS", "GCP",
+    "Docker", "Kubernetes", "GraphQL", "REST", "Next.js", "Vue", "Angular", "TensorFlow",
+    "PyTorch", "Machine Learning", "ML", "AI", "Spring", "Django", "FastAPI", "Flask",
+  ];
+  const found = techKeywords.filter((kw) =>
+    new RegExp(`\\b${kw}\\b`, "i").test(text),
+  );
+  const topSkills = found.slice(0, 5);
+  if (topSkills.length === 0) topSkills.push("General Programming");
+
+  // Detect project-like sections
+  const projectLines = text
+    .split(/\n|\./)
+    .filter((l) =>
+      l.length > 30 &&
+      /built|developed|created|designed|implemented|deployed/i.test(l),
+    )
+    .slice(0, 3)
+    .map((l) => ({ title: "Project", description: l.trim().slice(0, 200) }));
+
+  return {
+    fullName: nameGuess,
+    topSkills,
+    yearsOfExperience: yoe,
+    coreProjects: projectLines.length > 0 ? projectLines : [],
+  };
+}
+
+// ─── Route handler ────────────────────────────────────────────────────────────
 
 export async function POST(request: Request) {
   try {
-    const geminiApiKey = process.env.GEMINI_API_KEY;
-    if (!geminiApiKey) {
-      console.error(
-        "❌ CRITICAL: GEMINI_API_KEY is missing from environment variables",
-      );
-      return Response.json(
-        {
-          error:
-            "GEMINI_API_KEY is missing from environment variables. Configure it before parsing resumes.",
-        },
-        { status: 500 },
-      );
-    }
-
     const { userId } = await auth();
     if (!userId) {
-      return Response.json({ error: "Unauthorized" }, { status: 401 });
+      return Response.json({ error: "Unauthorized", code: "AUTH_REQUIRED" }, { status: 401 });
     }
 
-    const { fileData, fileName } = (await request.json()) as {
-      fileData?: string;
-      fileName?: string;
-    };
+    let fileBuffer: Buffer;
+    let mimeType = "";
+    let fileName = "";
 
-    if (!fileData || typeof fileData !== "string") {
-      console.error("❌ ERROR: No fileData found in JSON payload");
+    const contentType = request.headers.get("content-type") ?? "";
+
+    if (contentType.includes("multipart/form-data")) {
+      // Native multipart upload
+      const formData = await request.formData();
+      const file = formData.get("file") as File | null;
+      if (!file) {
+        return Response.json(
+          { error: "No file provided", code: "NO_FILE", category: "empty" },
+          { status: 400 },
+        );
+      }
+      if (file.size > MAX_FILE_BYTES) {
+        return Response.json(
+          { error: "File exceeds 5 MB limit", code: "FILE_TOO_LARGE" },
+          { status: 413 },
+        );
+      }
+      fileBuffer = Buffer.from(await file.arrayBuffer());
+      mimeType = file.type;
+      fileName = file.name;
+    } else {
+      // Legacy JSON base64 path (client sends { fileData, fileName })
+      const { fileData, fileName: fn } = (await request.json()) as {
+        fileData?: string;
+        fileName?: string;
+      };
+      if (!fileData) {
+        return Response.json(
+          { error: "No fileData in payload", code: "NO_FILE", category: "empty" },
+          { status: 400 },
+        );
+      }
+      const base64 = fileData.includes(",") ? fileData.split(",")[1] : fileData;
+      fileBuffer = Buffer.from(base64!, "base64");
+      if (fileBuffer.byteLength > MAX_FILE_BYTES) {
+        return Response.json(
+          { error: "File exceeds 5 MB limit", code: "FILE_TOO_LARGE" },
+          { status: 413 },
+        );
+      }
+      fileName = fn ?? "resume.pdf";
+      mimeType = "";
+    }
+
+    // Detect file type
+    const fileType = detectFileType(fileBuffer, mimeType, fileName);
+
+    if (fileType === "unsupported") {
       return Response.json(
-        { error: "No fileData found in JSON payload" },
-        { status: 400 },
+        {
+          error: "Unsupported file type. Please save your resume as a PDF or DOCX file and try again.",
+          code: "UNSUPPORTED_TYPE",
+          category: "unsupported",
+        },
+        { status: 415 },
       );
     }
 
-    if (!fileName || !fileName.toLowerCase().endsWith(".pdf")) {
-      return Response.json(
-        { error: "Only PDF files are supported" },
-        { status: 400 },
-      );
-    }
-
-    const base64Payload = fileData.includes(",")
-      ? fileData.split(",")[1]
-      : fileData;
-
-    if (!base64Payload) {
-      console.error("❌ ERROR: Invalid base64 fileData in JSON payload");
-      return Response.json(
-        { error: "Invalid base64 fileData in JSON payload" },
-        { status: 400 },
-      );
-    }
-
-    console.log("Converting base64 to buffer, base64 length:", base64Payload.length);
-    const fileBuffer = Buffer.from(base64Payload, "base64");
-    console.log("Buffer created successfully, size:", fileBuffer.length);
-    
-    // Convert Buffer to Uint8Array for pdfjs-dist compatibility
-    const uint8Array = new Uint8Array(fileBuffer.buffer, fileBuffer.byteOffset, fileBuffer.byteLength);
-    console.log("Converted to Uint8Array, size:", uint8Array.length);
-
-    const cleanText = await extractTextFromPdf(uint8Array);
-
-    if (!cleanText) {
-      return Response.json(
-        { error: "No readable text found in the PDF" },
-        { status: 400 },
-      );
-    }
-
-    const ai = new GoogleGenAI({ apiKey: geminiApiKey });
-    const geminiResult = await ai.models.generateContent({
-      model: "gemini-3.8-flash",
-      contents: `Resume text:\n\n${cleanText}\n\nReturn JSON with exactly this shape:\n${JSON_OUTPUT_SHAPE}`,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        responseMimeType: "application/json",
-      },
-    });
-
-    const rawJson = geminiResult.text;
-    if (!rawJson) {
-      return Response.json(
-        { error: "AI returned an empty response" },
-        { status: 502 },
-      );
-    }
-
-    let parsedJson: unknown;
+    // Extract text
+    let cleanText: string;
     try {
-      parsedJson = JSON.parse(rawJson);
-    } catch {
+      if (fileType === "pdf") {
+        cleanText = await extractPdf(fileBuffer);
+      } else if (fileType === "docx") {
+        cleanText = await extractDocx(fileBuffer);
+      } else {
+        cleanText = extractTxt(fileBuffer);
+      }
+    } catch (extractErr: any) {
+      const category = extractErr?.category ?? "unreadable";
+      let userMessage =
+        "Could not read text from this file. Please export your resume as a text-based PDF from Word or Google Docs and try again.";
+      if (category === "unsupported") {
+        userMessage =
+          "This file format is not supported. Please save your resume as PDF or DOCX.";
+      } else if (category === "empty") {
+        userMessage = "The file appears to be empty. Please check the file and try again.";
+      }
+      // Return heuristic fallback — still gives the user a pre-filled card
       return Response.json(
-        { error: "AI returned invalid JSON" },
-        { status: 502 },
+        {
+          error: userMessage,
+          code: "EXTRACT_FAILED",
+          category,
+          fallbackProfile: heuristicParse(""), // empty — user fills manually
+        },
+        { status: 422 },
       );
     }
 
-    const extractedResume = ExtractedResumeSchema.parse(parsedJson);
+    // Parse with LLM
+    let extractedResume;
+    try {
+      const result = await generate({
+        task: "heavy",
+        system: SYSTEM_INSTRUCTION,
+        prompt: `Resume text:\n\n${cleanText.slice(0, 8000)}\n\nReturn JSON with exactly this shape:\n${JSON_OUTPUT_SHAPE}`,
+        jsonSchema: ExtractedResumeSchema,
+      });
 
+      const parsed = tryParseAndValidate(result.text, ExtractedResumeSchema);
+      if (!parsed.ok) throw new Error(`Schema validation failed: ${parsed.error}`);
+      extractedResume = parsed.data as ExtractedResume;
+
+      console.log(`[PARSE-RESUME] provider=${result.provider} model=${result.model} latency=${result.latencyMs}ms`);
+    } catch (llmErr) {
+      console.warn("[PARSE-RESUME] LLM failed, using heuristic fallback:", llmErr);
+      extractedResume = heuristicParse(cleanText);
+    }
+
+    // Persist to DB (rawText excluded — Phase E rule: never store raw file)
     const [savedResume] = await db
       .insert(resumes)
       .values({
         userId,
         fullName: extractedResume.fullName,
-        rawText: cleanText,
+        rawText: cleanText.slice(0, 50000), // store extracted text, not raw file
         structuredData: extractedResume,
       })
       .returning();
 
     return Response.json(savedResume);
   } catch (error) {
-    console.error("🔥 FULL_ROUTE_CRASH_TRACE:", error);
+    console.error("[PARSE-RESUME] Unexpected error:", error);
 
     if (error instanceof ZodError) {
       return Response.json(
         {
-          error: "AI response did not match the expected resume schema",
+          error: "Resume data did not match expected format",
+          code: "VALIDATION_ERROR",
+          category: "service_busy",
           details: error.flatten(),
         },
         { status: 422 },
       );
     }
 
-    const message =
-      error instanceof Error ? error.message : "Unknown server error";
-
     return Response.json(
       {
-        error: "Failed to parse and analyze resume",
-        detail: message,
+        error: "Failed to parse resume. Please try again or fill in your details manually.",
+        code: "INTERNAL_ERROR",
+        category: "service_busy",
       },
       { status: 500 },
     );

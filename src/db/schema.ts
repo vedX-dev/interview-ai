@@ -56,6 +56,8 @@ export const interviews = pgTable(
     geminiCallsCount: integer("gemini_calls_count").default(0),
     totalTurns: integer("total_turns").default(0),
     adaptiveDecisionsCount: integer("adaptive_decisions_count").default(0),
+    // Server-owned conversation state (brain) — replaces client-driven phase/turn tracking
+    plan: jsonb("plan"),
   },
   (table) => [index("interviews_resume_id_idx").on(table.resumeId)],
 );

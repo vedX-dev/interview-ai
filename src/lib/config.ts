@@ -1,59 +1,41 @@
 /**
- * Environment configuration validation
- * Fails loudly if critical environment variables are missing
+ * Environment configuration validation.
+ * Only DATABASE_URL is hard-required (without it nothing works).
+ * LLM providers are optional — routes use the shared LLM layer which
+ * skips any provider whose env key is absent.
+ *
+ * Model IDs and provider configs live in src/lib/llm/config.ts.
  */
 
-const REQUIRED_ENV_VARS = [
-  "GEMINI_API_KEY",
-  "DATABASE_URL",
-] as const;
+const HARD_REQUIRED = ["DATABASE_URL"] as const;
 
-type RequiredEnvVar = (typeof REQUIRED_ENV_VARS)[number];
-
-const MISSING_ENV_VAR_ERROR = (varName: string) => `
-❌ CRITICAL CONFIGURATION ERROR ❌
-
-Required environment variable is missing: ${varName}
-
-This application cannot function without this variable.
-
-To fix this:
-1. Copy .env.example to .env
-2. Add ${varName}=your_value_here to .env
-3. Restart the development server
-
-For ${varName === "GEMINI_API_KEY" ? "Gemini API key" : "database connection"} help, see the README.
-`;
-
-export function validateEnvVars(): void {
-  const missing: RequiredEnvVar[] = [];
-
-  for (const varName of REQUIRED_ENV_VARS) {
+if (typeof window === "undefined") {
+  for (const varName of HARD_REQUIRED) {
     if (!process.env[varName]) {
-      missing.push(varName);
+      console.error(
+        `❌ CRITICAL: Required environment variable ${varName} is missing. ` +
+          `Copy .env.example to .env.local and fill in the value.`,
+      );
+      // Don't throw — let individual routes surface errors with context.
     }
   }
 
-  if (missing.length > 0) {
-    const errorMessages = missing.map(MISSING_ENV_VAR_ERROR).join("\n");
-    console.error(errorMessages);
-    throw new Error(
-      `Missing required environment variables: ${missing.join(", ")}. Check console for details.`
-    );
-  }
+  // Soft warnings for optional providers
+  const optional: Record<string, string> = {
+    GEMINI_API_KEY: "Gemini LLM + embeddings",
+    GROQ_API_KEY: "Groq LLM (fast fallback)",
+    SARVAM_API_KEY: "Sarvam TTS",
+  };
 
-  console.log("✅ All required environment variables are configured");
+  for (const [key, desc] of Object.entries(optional)) {
+    if (!process.env[key]) {
+      console.warn(`⚠️  ${key} not set — ${desc} will be unavailable.`);
+    }
+  }
 }
 
-// Validate on import (will fail fast on startup)
-if (typeof window === "undefined") {
-  validateEnvVars();
-}
-
-export function getEnvVar(varName: RequiredEnvVar): string {
-  const value = process.env[varName];
-  if (!value) {
-    throw new Error(`Environment variable ${varName} is not configured`);
-  }
-  return value;
+export function getRequiredEnv(name: string): string {
+  const val = process.env[name];
+  if (!val) throw new Error(`Environment variable ${name} is not configured`);
+  return val;
 }
