@@ -66,7 +66,7 @@ const JSON_OUTPUT_SHAPE = `{
 
 export async function POST(
   req: NextRequest,
-  { params }: { params: { id: string } },
+  { params }: { params: Promise<{ id: string }> },
 ) {
   try {
     const { userId } = await auth();
@@ -74,7 +74,7 @@ export async function POST(
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const interviewId = params.id;
+    const { id: interviewId } = await params;
 
     // Verify interview belongs to user
     const [interview] = await db
@@ -130,7 +130,7 @@ ${transcript}
     const ai = new GoogleGenAI({ apiKey: geminiApiKey });
 
     const geminiResult = await ai.models.generateContent({
-      model: "gemini-1.5-flash",
+      model: "gemini-3.8-flash",
       contents: `${interviewContext}\n\nGenerate a comprehensive feedback report with exactly this JSON shape:\n${JSON_OUTPUT_SHAPE}`,
       config: {
         systemInstruction: SYSTEM_INSTRUCTION,

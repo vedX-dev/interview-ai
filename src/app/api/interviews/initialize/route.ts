@@ -13,8 +13,9 @@ import { checkRateLimit, checkDailyLimit } from "@/src/lib/rate-limit";
 import "@/src/lib/config";
 
 const InitializeRequestSchema = z.object({
-  resumeId: z.string().uuid(),
+  resumeId: z.string(),
   jobRole: z.string().min(1).max(200),
+  customCandidateProfile: ExtractedResumeSchema.optional(),
 });
 
 export async function POST(req: NextRequest) {
@@ -70,6 +71,23 @@ export async function POST(req: NextRequest) {
           "Resume lookup skipped or failed; using mock profile:",
           lookupError,
         );
+      }
+    }
+
+    if (body.customCandidateProfile) {
+      candidateProfile = body.customCandidateProfile;
+      if (resumeIdForDb) {
+        try {
+          await db
+            .update(resumes)
+            .set({
+              fullName: candidateProfile.fullName,
+              structuredData: candidateProfile,
+            })
+            .where(eq(resumes.id, resumeIdForDb));
+        } catch (updateErr) {
+          console.warn("Failed to persist updated resume to DB:", updateErr);
+        }
       }
     }
 

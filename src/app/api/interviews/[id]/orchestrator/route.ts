@@ -19,35 +19,51 @@ async function callGroqAPI(context: string, systemInstruction: string) {
     throw new Error("GROQ_API_KEY not configured");
   }
 
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${groqApiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "llama-3.3-70b-versatile",
-      messages: [
-        {
-          role: "system",
-          content: systemInstruction,
-        },
-        {
-          role: "user",
-          content: `${context}\n\nReturn JSON with exactly this shape:\n${JSON_OUTPUT_SHAPE}`,
-        },
-      ],
-      response_format: { type: "json_object" },
-      temperature: 0.7,
-    }),
-  });
+  const models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"];
+  let lastError: Error | null = null;
 
-  if (!response.ok) {
-    throw new Error(`Groq API failed: ${response.status}`);
+  for (const model of models) {
+    try {
+      const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${groqApiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            {
+              role: "system",
+              content: `${systemInstruction}\nYou MUST respond with valid JSON matching the requested shape.`,
+            },
+            {
+              role: "user",
+              content: `${context}\n\nReturn JSON with exactly this shape:\n${JSON_OUTPUT_SHAPE}`,
+            },
+          ],
+          response_format: { type: "json_object" },
+          temperature: 0.7,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Groq API (${model}) failed with ${response.status}: ${errorText}`);
+      }
+
+      const data = await response.json();
+      const content = data.choices?.[0]?.message?.content;
+      if (content) {
+        return content;
+      }
+    } catch (err: any) {
+      console.warn(`Groq model ${model} failed:`, err.message);
+      lastError = err;
+    }
   }
 
-  const data = await response.json();
-  return data.choices[0].message.content;
+  throw lastError || new Error("All Groq models failed");
 }
 
 const DEBUG = true; // Set to false in production
@@ -112,30 +128,37 @@ async function callAIWithFallback(context: string, systemInstruction: string) {
     }
 
     const ai = new GoogleGenAI({ apiKey: geminiApiKey });
+    const geminiModels = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
     
-    let delay = 1000;
-    for (let i = 0; i < 3; i++) {
-      try {
-        const geminiResult = await ai.models.generateContent({
-          model: "gemini-3.5-flash",
-          contents: `${context}\n\nReturn JSON with exactly this shape:\n${JSON_OUTPUT_SHAPE}`,
-          config: {
-            systemInstruction,
-            responseMimeType: "application/json",
-          },
-        });
-        return { provider: "gemini", text: geminiResult.text };
-      } catch (error: any) {
-        const is503 = error?.status === 503 || error?.message?.includes("503");
-        const isLastRetry = i === 2;
-        
-        if (is503 && !isLastRetry) {
-          console.warn(`Gemini 503 error. Retrying in ${delay}ms... (Attempt ${i + 1}/3)`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-          delay *= 2;
-          continue;
+    for (const model of geminiModels) {
+      let delay = 1000;
+      for (let i = 0; i < 3; i++) {
+        try {
+          const geminiResult = await ai.models.generateContent({
+            model,
+            contents: `${context}\n\nReturn JSON with exactly this shape:\n${JSON_OUTPUT_SHAPE}`,
+            config: {
+              systemInstruction,
+              responseMimeType: "application/json",
+            },
+          });
+          return { provider: `gemini (${model})`, text: geminiResult.text };
+        } catch (error: any) {
+          const is503OrUnavailable = error?.status === 503 || error?.status === 404 || error?.message?.includes("503") || error?.message?.includes("UNAVAILABLE") || error?.message?.includes("404");
+          const isLastRetry = i === 2;
+          
+          if (is503OrUnavailable && !isLastRetry) {
+            console.warn(`Gemini (${model}) error: ${error.message}. Retrying in ${delay}ms... (Attempt ${i + 1}/3)`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            delay *= 2;
+            continue;
+          }
+          if (model === geminiModels[geminiModels.length - 1] && isLastRetry) {
+            throw error;
+          }
+          console.warn(`Gemini model ${model} failed, trying next model...`);
+          break;
         }
-        throw error;
       }
     }
   } catch (error: any) {

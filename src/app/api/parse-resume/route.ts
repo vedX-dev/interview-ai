@@ -144,7 +144,7 @@ export async function POST(request: Request) {
 
     const ai = new GoogleGenAI({ apiKey: geminiApiKey });
     const geminiResult = await ai.models.generateContent({
-      model: "gemini-1.5-flash",
+      model: "gemini-3.8-flash",
       contents: `Resume text:\n\n${cleanText}\n\nReturn JSON with exactly this shape:\n${JSON_OUTPUT_SHAPE}`,
       config: {
         systemInstruction: SYSTEM_INSTRUCTION,
