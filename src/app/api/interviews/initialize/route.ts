@@ -91,6 +91,10 @@ export async function POST(req: NextRequest) {
       `Before we begin, is there anything you'd like to check on your end — audio, video, anything like that?`;
 
     // ── Bootstrap ConversationState ──────────────────────────────────────────
+    // Assign a random seed (0-999) for this interview. Never changes after creation.
+    // Drives topic shuffle order, opening template selection, fallback phrasing rotation.
+    const conversationSeed = Math.floor(Math.random() * 1000);
+
     const initialState = ConversationStateSchema.parse({
       phase: "intro",
       coverage: [], // Populated in after() below to not block the response
@@ -99,6 +103,7 @@ export async function POST(req: NextRequest) {
       followUpsOnCurrent: 0,
       turnCount: 0,
       firstName,
+      conversationSeed,
     });
 
     // ── Create interview row ─────────────────────────────────────────────────
@@ -125,13 +130,13 @@ export async function POST(req: NextRequest) {
     // ── Generate topics asynchronously (non-blocking) ────────────────────────
     after(async () => {
       try {
-        const topics = await generateCoverageTopics(body.jobRole, candidateProfile);
+        const topics = await generateCoverageTopics(body.jobRole, candidateProfile, conversationSeed);
         const stateWithTopics = { ...initialState, coverage: topics };
         await db
           .update(interviews)
           .set({ plan: stateWithTopics as any })
           .where(eq(interviews.id, createdInterview.id));
-        console.log(`[INITIALIZE] Generated ${topics.length} coverage topics for ${createdInterview.id}`);
+        console.log(`[INITIALIZE] Generated ${topics.length} coverage topics (seed=${conversationSeed}) for ${createdInterview.id}`);
       } catch (err) {
         console.warn("[INITIALIZE] after(): topic generation failed:", (err as Error).message);
       }

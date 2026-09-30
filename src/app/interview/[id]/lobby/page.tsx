@@ -64,6 +64,11 @@ export default function InterviewLobbyPage() {
         }
         console.log("[LOBBY] Interview validated:", interviewId);
         setIsValidating(false);
+
+        // Phase 3: Lobby background pre-computation (topics, opening variants, provider pool warm)
+        fetch(`/api/interviews/${interviewId}/prewarm`, { method: "POST" }).catch((e) => {
+          console.warn("[LOBBY] Background prewarm triggered (non-blocking):", e);
+        });
       } catch (err) {
         console.error("[LOBBY] Validation error:", err);
         setError("Failed to validate interview. Redirecting to home...");

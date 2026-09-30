@@ -290,7 +290,7 @@ export default function InterviewRoomPage() {
                 if (data.isTerminated) {
                   setIsTerminatedByIntegrity(true);
                   setCurrentPhase("closed");
-                  setTimeout(() => { router.push(`/interview/${interviewId}/feedback`); }, 3500);
+                  setTimeout(() => { void endInterviewSession("integrity"); }, 3000);
                 } else {
                   setTimeout(() => { setIntegrityWarning(null); }, 6000);
                 }
@@ -928,36 +928,57 @@ export default function InterviewRoomPage() {
     }
   };
 
-  const generateFeedback = async () => {
-    if (!interviewId || isGeneratingFeedback) return;
+  const isEndingRef = useRef(false);
 
-    setIsGeneratingFeedback(true);
-    setTurnState("processing");
+  /**
+   * Unified End-Interview Handler (Phase 6)
+   * Triggered by: manual end, natural completion, integrity termination, or turn/time cap.
+   */
+  const endInterviewSession = useCallback(async (reason: "manual" | "natural" | "integrity" | "cap_reached") => {
+    if (isEndingRef.current) return;
+    isEndingRef.current = true;
+    console.log(`[END_SESSION] Terminating interview session (${reason}) for ${interviewId}`);
 
-    try {
-      const response = await fetch(`/api/interviews/${interviewId}/feedback/generate`, {
-        method: "POST",
-      });
+    // 1. Immediately stop all active audio playback
+    stopAiSpeech();
 
-      const data = await response.json();
+    // 2. Immediately stop speech recognition
+    stopListening();
 
-      if (!response.ok) {
-        throw new Error(typeof data.error === "string" ? data.error : "Failed to generate feedback");
-      }
-
-      setFeedback(data);
-      setShowFeedback(true);
-      setTurnState("idle");
-    } catch (error) {
-      setTranscriptError(
-        error instanceof Error 
-          ? `Failed to generate feedback: ${error.message}. The interview completed but feedback generation failed.`
-          : "Failed to generate feedback. The interview completed but feedback generation failed.",
-      );
-      setTurnState("idle");
-    } finally {
-      setIsGeneratingFeedback(false);
+    // 3. Immediately stop integrity detectors
+    if (integrityDetectorRef.current) {
+      try {
+        integrityDetectorRef.current.stop();
+      } catch (e) {}
     }
+
+    // 4. Immediately stop camera stream and release media tracks
+    if (mediaStream) {
+      mediaStream.getTracks().forEach((t) => t.stop());
+      setMediaStream(null);
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+
+    // 5. Update UI state to feedback transition
+    setIsGeneratingFeedback(true);
+    setTurnState("idle");
+    setCurrentPhase("closed");
+
+    // 6. Trigger server-side feedback generation (fire-and-forget / non-blocking)
+    try {
+      fetch(`/api/interviews/${interviewId}/feedback/generate`, {
+        method: "POST",
+      }).catch((e) => console.warn("[END_SESSION] Feedback trigger error (non-critical):", e));
+    } catch {}
+
+    // 7. Route to feedback report page (which displays full report and handles polling/fallbacks)
+    router.push(`/interview/${interviewId}/feedback`);
+  }, [interviewId, mediaStream, stopAiSpeech, stopListening, router]);
+
+  const generateFeedback = async () => {
+    await endInterviewSession("natural");
   };
 
   const handleRagQuery = async () => {

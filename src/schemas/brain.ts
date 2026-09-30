@@ -87,6 +87,37 @@ export const ConversationStateSchema = z.object({
   clarifyCount: z.number().int().min(0).default(0),
   /** Candidate language choice */
   candidateLang: z.enum(["en-IN", "hi-IN", "hinglish"]).default("en-IN"),
+  /**
+   * The open conversational thread being actively followed from the candidate's last answer.
+   * e.g. "pgvector usage in interview system" — set by answer-grounding logic, cleared on topic change.
+   */
+  activeThread: z.string().optional(),
+  /** How many consecutive turns have focused on the current activeThread */
+  threadDepth: z.number().int().min(0).default(0),
+  /**
+   * Random seed (0-999) assigned at initialize, persisted for the lifetime of the interview.
+   * Drives topic shuffle order, opening template selection, and fallback phrasing rotation.
+   * Never changes after creation.
+   */
+  conversationSeed: z.number().int().min(0).max(999).default(0),
+  /**
+   * K-Score: rolling exponentially-weighted knowledge/performance score (0-10).
+   * Tracks candidate quality trend across scored turns, separate from per-turn scores.
+   * Updated after every scorable turn (intent=answer|partial).
+   */
+  kScore: z.number().min(0).max(10).default(5),
+  /** Trend direction for K-Score: rising after 2+ strong turns, falling after 2+ weak turns, flat otherwise */
+  kScoreTrend: z.enum(["rising", "flat", "falling"]).default("flat"),
+  /**
+   * Adaptive depth target for the current turn, computed by the brain from kScore + kScoreTrend.
+   * Passed to the LLM as an instruction. Recomputed each turn.
+   */
+  targetDepth: z.enum(["easy", "medium", "hard"]).default("easy"),
+  /**
+   * Pre-generated opening question variants (up to 3), created during lobby pre-warm.
+   * One is selected by conversationSeed when the interview starts.
+   */
+  openingVariants: z.array(z.string()).default([]),
 });
 
 export type ConversationState = z.infer<typeof ConversationStateSchema>;

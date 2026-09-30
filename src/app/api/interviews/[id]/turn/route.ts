@@ -39,11 +39,18 @@ import {
   activateNextTopic,
   closeActiveTopic,
   getFallbackUtterance,
+  getSeedFallbackUtterance,
   generateCoverageTopics,
+  extractSignalsFromAnswer,
+  updateKScore,
+  computeTargetDepth,
+  computeAvgAnswerLength,
+  getOpeningTemplate,
 } from "@/src/lib/interview/state";
 import { INTERVIEWER_SYSTEM_PROMPT, buildTurnContext } from "@/src/lib/interview/prompt";
 import { BRAIN_CONFIG } from "@/src/lib/interview/brain-config";
 import { checkTurnLimit, isReplayedRequest } from "@/src/lib/rate-limit";
+import { getKBEntry } from "@/src/lib/interview/knowledge-base/index";
 
 const IS_DEV = process.env.NODE_ENV !== "production";
 
@@ -118,13 +125,14 @@ export async function POST(
         const parsed = ExtractedResumeSchema.safeParse(feedbackObj.candidateProfile);
         if (parsed.success) resume = parsed.data;
       }
-    } catch {}
+    } catch { }
 
     // ── 3. First-turn bootstrap ───────────────────────────────────────────────
     // If coverage is empty, generate topics now (once per interview)
     if (state.coverage.length === 0) {
-      state.coverage = await generateCoverageTopics(interview.jobRole, resume);
-      console.log(`[TURN] Generated ${state.coverage.length} coverage topics for ${interviewId}`);
+      const seed = state.conversationSeed ?? 0;
+      state.coverage = await generateCoverageTopics(interview.jobRole, resume, seed);
+      console.log(`[TURN] Generated ${state.coverage.length} coverage topics (seed=${seed}) for ${interviewId}`);
     }
 
     // Phase: intro → warmup on first candidate utterance (unconditional)
@@ -179,7 +187,34 @@ export async function POST(
       }
     }
 
-    // ── 7. LLM call (evaluate + decide + speak) ───────────────────────────────
+    // ── 7. Extract answer signals for grounded follow-up ─────────────────────
+    const signals = extractSignalsFromAnswer(utterance, currentState.facts ?? []);
+    if (signals.technologies.length || signals.claims.length) {
+      console.log(`[TURN] Signals: tech=[${signals.technologies.join(",")}] claims=${signals.claims.length} threads=${signals.openThreads.length}`);
+    }
+
+    // ── 8. LLM call (evaluate + decide + speak) ───────────────────────────────
+    // Compute adaptive depth BEFORE the LLM call so it's injected into context
+    const activeTopic = currentState.coverage.find((t) => t.status === "active");
+    const recentScores = currentState.scores.map((s) => s.score);
+    const turnsOnTopic = activeTopic?.followUps ?? 0;
+    const targetDepth = computeTargetDepth(
+      currentState.kScore ?? 5,
+      currentState.kScoreTrend ?? "flat",
+      turnsOnTopic,
+    );
+    const avgAnswerWords = computeAvgAnswerLength(body.recentTranscript);
+
+    // Get KB entry for the active topic to pass depth ladder guidance
+    const kbEntry = activeTopic ? getKBEntry(activeTopic.id) : undefined;
+    const depthGuidance = kbEntry ? kbEntry.depthLadder[targetDepth] : undefined;
+
+    // Get opening template for warmup first turn
+    const isFirstWarmupTurn = currentState.phase === "warmup" && currentState.turnCount === 0;
+    const openingTemplate = isFirstWarmupTurn
+      ? getOpeningTemplate(currentState.conversationSeed ?? 0)
+      : undefined;
+
     const contextBlock = buildTurnContext({
       jobRole: interview.jobRole,
       state: currentState,
@@ -190,6 +225,11 @@ export async function POST(
       remainingMinutes,
       candidateLang: body.lang || currentState.candidateLang || "en-IN",
       sttConfidence: body.sttConfidence || 0.95,
+      signals,
+      targetDepth,
+      depthGuidance,
+      avgAnswerWords,
+      openingTemplate,
     });
 
     let llmResponse = null;
@@ -258,7 +298,8 @@ export async function POST(
       }
     } else {
       // All providers failed — use deterministic fallback (never greeting, never repeat)
-      finalSay = getFallbackUtterance(currentState);
+      // Use seed-based fallback for variety across interviews
+      finalSay = getSeedFallbackUtterance(currentState);
       finalAction = "fallback";
       console.warn("[TURN] Using deterministic fallback utterance");
     }
@@ -275,7 +316,7 @@ export async function POST(
     }
 
     // Record asked question (for repeat guard)
-    const activeTopic = newState.coverage.find((t) => t.status === "active");
+    const currentActiveTopic = newState.coverage.find((t) => t.status === "active");
     if (
       finalSay &&
       finalAction !== "clarify" &&
@@ -284,7 +325,7 @@ export async function POST(
     ) {
       const askedEntry: AskedQuestion = {
         question: finalSay,
-        topic: activeTopic?.id ?? newState.phase,
+        topic: currentActiveTopic?.id ?? newState.phase,
         turnIndex: newState.turnCount,
       };
       newState.asked = [...newState.asked, askedEntry];
@@ -304,6 +345,22 @@ export async function POST(
         gaps: llmResponse!.evaluation.gaps || [],
       };
       newState.scores = [...newState.scores, score];
+
+      // ── Phase 2: Update K-Score ────────────────────────────────────────────
+      const prevScoreValues = newState.scores.slice(0, -1).map((s) => s.score);
+      const { kScore, kScoreTrend } = updateKScore(
+        newState.kScore ?? 5,
+        score.score,
+        prevScoreValues,
+      );
+      newState.kScore = kScore;
+      newState.kScoreTrend = kScoreTrend;
+      newState.targetDepth = computeTargetDepth(kScore, kScoreTrend, turnsOnTopic);
+
+      console.log(
+        `[TURN] kScore=${kScore.toFixed(2)} trend=${kScoreTrend} targetDepth=${newState.targetDepth} ` +
+        `turnScore=${score.score} topic=${activeTopic.id}`,
+      );
     }
 
     // Update follow-up counter
@@ -313,6 +370,29 @@ export async function POST(
         const idx = newState.coverage.findIndex((t) => t.id === activeTopic.id);
         if (idx !== -1) newState.coverage[idx].followUps++;
       }
+    }
+
+    // ── Thread tracking (answer-grounded follow-up) ───────────────────────────
+    // When following up on an answer, update the active thread from signals.
+    // When advancing topic, clear the thread so the new topic starts fresh.
+    const isAnswerIntent = finalIntent === "answer" || finalIntent === "partial";
+    if (finalAction === "followup" && isAnswerIntent) {
+      // Build a thread label from the strongest signal
+      const topTech = signals.technologies[0];
+      const topClaim = signals.claims[0];
+      const newThread = topTech
+        ? `${topTech}${topClaim ? ` — ${topClaim.slice(0, 60)}` : ""}`
+        : topClaim
+          ? topClaim.slice(0, 80)
+          : newState.activeThread; // keep existing thread if no new signals
+      if (newThread) {
+        newState.activeThread = newThread;
+        newState.threadDepth = (newState.threadDepth ?? 0) + 1;
+      }
+    } else if (finalAction === "next_topic" || shouldAdvanceTopic) {
+      // Moving to a new topic — reset thread
+      newState.activeThread = undefined;
+      newState.threadDepth = 0;
     }
 
     // Advance topic (pure function)
@@ -359,16 +439,16 @@ export async function POST(
       isComplete,
       ...(IS_DEV
         ? {
-            _dev: {
-              intent: finalIntent,
-              evaluation: evalSnapshot,
-              decision: decisionSnapshot,
-              provider,
-              latencyMs: totalLatencyMs,
-              action: finalAction,
-              attempts: attemptsList,
-            },
-          }
+          _dev: {
+            intent: finalIntent,
+            evaluation: evalSnapshot,
+            decision: decisionSnapshot,
+            provider,
+            latencyMs: totalLatencyMs,
+            action: finalAction,
+            attempts: attemptsList,
+          },
+        }
         : {}),
     };
 

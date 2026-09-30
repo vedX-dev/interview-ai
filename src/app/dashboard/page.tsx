@@ -1,6 +1,7 @@
 "use client";
 
 import { ResumeUploadFlow } from "@/src/components/resume-upload-flow";
+import { InterviewHistory } from "@/src/components/interview-history";
 
 export default function Dashboard() {
   return (
@@ -9,7 +10,7 @@ export default function Dashboard() {
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_top,_rgba(139,92,246,0.12)_0%,_transparent_60%)]" />
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_bottom_right,_rgba(56,189,248,0.08)_0%,_transparent_50%)]" />
 
-      <div className="relative z-10 mx-auto max-w-4xl space-y-8">
+      <div className="relative z-10 mx-auto max-w-4xl space-y-10">
         <div className="space-y-2 text-center sm:text-left">
           <div className="inline-flex items-center gap-2 rounded-full border border-violet-500/20 bg-violet-500/10 px-3 py-1 text-xs font-semibold text-violet-400">
             <span>InterviewAI Candidate Portal</span>
@@ -24,6 +25,9 @@ export default function Dashboard() {
 
         {/* Resume Upload & Editable Confirmation Card Flow */}
         <ResumeUploadFlow />
+
+        {/* Candidate Past Interview History & Performance Reports */}
+        <InterviewHistory />
       </div>
     </main>
   );

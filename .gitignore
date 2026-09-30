@@ -53,3 +53,10 @@ drizzle/
 
 # clerk configuration (can include secrets)
 /.clerk/
+
+# Agents
+/agents
+
+# Markdown documentation files
+*.md
+**/*.md
