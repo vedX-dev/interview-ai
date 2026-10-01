@@ -1,0 +1,12 @@
+{"interviewId":"test-session-01","turnId":1,"stage":"candidate_speech_end","ts":1727784000000}
+{"interviewId":"test-session-01","turnId":1,"stage":"turn_request_received","ts":1727784000150}
+{"interviewId":"test-session-01","turnId":1,"stage":"llm_completion","ts":1727784000620}
+{"interviewId":"test-session-01","turnId":1,"stage":"tts_start","ts":1727784000630}
+{"interviewId":"test-session-01","turnId":1,"stage":"tts_finish","ts":1727784001150}
+{"interviewId":"test-session-01","turnId":1,"stage":"audio_playback_start","ts":1727784001200}
+{"interviewId":"test-session-01","turnId":2,"stage":"candidate_speech_end","ts":1727784030000}
+{"interviewId":"test-session-01","turnId":2,"stage":"turn_request_received","ts":1727784030140}
+{"interviewId":"test-session-01","turnId":2,"stage":"llm_completion","ts":1727784030580}
+{"interviewId":"test-session-01","turnId":2,"stage":"tts_start","ts":1727784030590}
+{"interviewId":"test-session-01","turnId":2,"stage":"tts_finish","ts":1727784031050}
+{"interviewId":"test-session-01","turnId":2,"stage":"audio_playback_start","ts":1727784031100}

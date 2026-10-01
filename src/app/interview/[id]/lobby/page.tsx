@@ -296,7 +296,18 @@ export default function InterviewLobbyPage() {
     }, 300);
   };
 
-  const canStartInterview = !isValidating && micPermission === "granted" && sttTested && ttsTested && speakerWorks && integrityConsent;
+  // Research Mode State
+  const isResearchMode = process.env.NEXT_PUBLIC_RESEARCH_MODE === "true";
+  const [researchConsent, setResearchConsent] = useState(false);
+
+  const canStartInterview =
+    !isValidating &&
+    micPermission === "granted" &&
+    sttTested &&
+    ttsTested &&
+    speakerWorks &&
+    integrityConsent &&
+    (!isResearchMode || researchConsent);
 
   const startInterview = () => {
     console.log("[LOBBY] Starting interview with ID:", interviewId);
@@ -513,6 +524,25 @@ export default function InterviewLobbyPage() {
               </label>
             </div>
           </div>
+
+          {/* Research Mode Notice & Consent (Gated behind NEXT_PUBLIC_RESEARCH_MODE=true) */}
+          {isResearchMode && (
+            <div className="bg-purple-950/40 p-3 rounded-lg border border-purple-600/50 space-y-2">
+              <div className="flex items-start gap-2">
+                <input
+                  type="checkbox"
+                  id="researchConsent"
+                  checked={researchConsent}
+                  onChange={(e) => setResearchConsent(e.target.checked)}
+                  className="mt-0.5 rounded border-purple-500 bg-zinc-900 text-purple-600 focus:ring-purple-500"
+                />
+                <label htmlFor="researchConsent" className="text-[11px] text-purple-200 cursor-pointer">
+                  <span className="font-bold text-white block">🔬 Research Mode Opt-In Required</span>
+                  Research mode: this test session's audio will be temporarily recorded locally for transcription accuracy testing only, and deleted after the session.
+                </label>
+              </div>
+            </div>
+          )}
 
           {/* Speech Recognition Test */}
           <div className="space-y-1">

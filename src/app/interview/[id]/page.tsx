@@ -391,6 +391,23 @@ export default function InterviewRoomPage() {
 
   const isAiSpeaking = turnState === "ai_speaking";
 
+  // Latency eval helper (gated behind NEXT_PUBLIC_RESEARCH_MODE === "true")
+  const sendClientLatencyLog = useCallback((stage: "candidate_speech_end" | "audio_playback_start", turnNum?: number) => {
+    if (process.env.NEXT_PUBLIC_RESEARCH_MODE !== "true") return;
+    const ts = Date.now();
+    console.log(`[EVAL_LATENCY] stage=${stage} ts=${ts}`);
+    fetch("/api/eval/latency", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        interviewId,
+        turnId: turnNum ?? transcript.length + 1,
+        stage,
+        ts,
+      }),
+    }).catch(() => {});
+  }, [interviewId, transcript.length]);
+
   // Stop all active AI speech immediately (Barge-in / Interruption)
   const stopAiSpeech = useCallback(() => {
     if (activeAudioRef.current) {
@@ -532,6 +549,7 @@ export default function InterviewRoomPage() {
         };
         audio.oncanplaythrough = () => {
           if (activeAudioRef.current === audio) {
+            sendClientLatencyLog("audio_playback_start");
             audio.play().catch(reject);
           }
         };
@@ -904,6 +922,8 @@ export default function InterviewRoomPage() {
   const handleSpeak = async (text?: string) => {
     const finalText = (text || userInput).trim();
     if (!finalText || turnState !== "user_turn") return;
+
+    sendClientLatencyLog("candidate_speech_end");
 
     setUserInput("");
     setInterimTranscript("");

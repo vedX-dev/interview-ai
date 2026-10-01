@@ -51,6 +51,7 @@ import { INTERVIEWER_SYSTEM_PROMPT, buildTurnContext } from "@/src/lib/interview
 import { BRAIN_CONFIG } from "@/src/lib/interview/brain-config";
 import { checkTurnLimit, isReplayedRequest } from "@/src/lib/rate-limit";
 import { getKBEntry } from "@/src/lib/interview/knowledge-base/index";
+import { logEvalLatency } from "@/src/eval/logger";
 
 const IS_DEV = process.env.NODE_ENV !== "production";
 
@@ -105,6 +106,13 @@ export async function POST(
 
     // Parse state (server-owned — never trust client phase)
     let state: ConversationState = loadState(interview.plan);
+
+    logEvalLatency({
+      interviewId,
+      turnId: state.turnCount + 1,
+      stage: "turn_request_received",
+      ts: routeStart,
+    });
 
     // ── Idempotency Check ──────────────────────────────────────────────────
     // requestId uses interviewId + turnCount + short hash of content (no raw utterance text in logs)
@@ -248,6 +256,14 @@ export async function POST(
       llmLatencyMs = Date.now() - llmStart;
       provider = result.provider;
       attemptsList = result.attempts || [];
+
+      logEvalLatency({
+        interviewId,
+        turnId: currentState.turnCount + 1,
+        stage: "llm_completion",
+        ts: llmStart + llmLatencyMs,
+        extra: { provider, llmLatencyMs },
+      });
 
       const parsed = tryParseAndValidate(result.text, LLMTurnResponseSchema);
       if (parsed.ok) {

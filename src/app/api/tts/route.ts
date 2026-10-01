@@ -14,6 +14,7 @@ import { auth } from "@clerk/nextjs/server";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createHash } from "crypto";
+import { logEvalLatency } from "@/src/eval/logger";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -178,6 +179,14 @@ export async function POST(req: NextRequest) {
     console.log(`[TTS] Synthesizing ${chunks.length} chunk(s) speaker=${speaker} totalChars=${cleanText.length}`);
 
     const audioResults: string[] = [];
+    const ttsStart = Date.now();
+
+    logEvalLatency({
+      interviewId: "active_session",
+      turnId: "current",
+      stage: "tts_start",
+      ts: ttsStart,
+    });
 
     for (const chunk of chunks) {
       const resp = await fetch(SARVAM_API, {
@@ -213,6 +222,15 @@ export async function POST(req: NextRequest) {
         audioResults.push(data.audios[0]);
       }
     }
+
+    const ttsFinish = Date.now();
+    logEvalLatency({
+      interviewId: "active_session",
+      turnId: "current",
+      stage: "tts_finish",
+      ts: ttsFinish,
+      extra: { durationMs: ttsFinish - ttsStart },
+    });
 
     if (audioResults.length === 0) {
       return NextResponse.json({ fallback: true, reason: "No audio generated" });

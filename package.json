@@ -9,7 +9,12 @@
     "lint": "eslint",
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
-    "db:studio": "drizzle-kit studio"
+    "db:studio": "drizzle-kit studio",
+    "eval:latency": "tsx src/eval/collect-latency.ts",
+    "eval:export-turns": "tsx src/eval/export-turns.ts",
+    "eval:export-questions": "tsx src/eval/export-questions.ts",
+    "eval:report": "tsx src/eval/run-report.ts",
+    "eval:generate-doc": "tsx src/eval/generate-viva-doc.ts"
   },
   "dependencies": {
     "@clerk/nextjs": "^7.2.7",
