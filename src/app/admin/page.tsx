@@ -30,7 +30,34 @@ import {
   Check,
   ChevronRight,
   Info,
+  Camera,
+  UserCheck,
+  PieChart as PieChartIcon,
 } from "lucide-react";
+import {
+  ResponsiveContainer,
+  AreaChart,
+  Area,
+  BarChart,
+  Bar,
+  PieChart,
+  Pie,
+  Cell,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+} from "recharts";
+
+interface CandidateSnapshotItem {
+  id: string;
+  candidateName: string;
+  jobRole: string;
+  status: string;
+  score: number | null;
+  createdAt: string;
+  candidateSnapshot: string | null;
+}
 
 interface AnalyticsData {
   platform: {
@@ -55,6 +82,7 @@ interface AnalyticsData {
   skillConfidences: { high: number; medium: number; low: number };
   answerQualityDistribution: Record<string, number>;
   sessionsPerDay: Record<string, number>;
+  candidateSnapshots?: CandidateSnapshotItem[];
   clientNetwork?: {
     clientIp: string;
     allowedIpsConfigured: boolean;
@@ -65,7 +93,7 @@ interface AnalyticsData {
   generatedAt: string;
 }
 
-type TabType = "overview" | "scoring" | "research" | "network";
+type TabType = "overview" | "scoring" | "research" | "network" | "snapshots";
 
 export default function AdminDashboardPage() {
   const [data, setData] = useState<AnalyticsData | null>(null);
@@ -74,7 +102,12 @@ export default function AdminDashboardPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [downloadingPdf, setDownloadingPdf] = useState(false);
   const [activeTab, setActiveTab] = useState<TabType>("overview");
+  const [isMounted, setIsMounted] = useState(false);
   const reportRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setIsMounted(true);
+  }, []);
 
   const fetchData = async () => {
     try {
@@ -131,8 +164,8 @@ export default function AdminDashboardPage() {
         format: "a4",
       });
 
-      const imgWidth = 210; // A4 width in mm
-      const pageHeight = 297; // A4 height in mm
+      const imgWidth = 210;
+      const pageHeight = 297;
       const imgHeight = (canvas.height * imgWidth) / canvas.width;
       let heightLeft = imgHeight;
       let position = 0;
@@ -196,18 +229,48 @@ export default function AdminDashboardPage() {
 
   const { platform, scoring, hiringRecommendations, skillConfidences, answerQualityDistribution, sessionsPerDay, clientNetwork } = data;
 
-  const sessionDays = Object.entries(sessionsPerDay);
-  const maxSessions = Math.max(...sessionDays.map(([, v]) => v), 1);
+  // Formatting session days data for Recharts
+  const sessionChartData = Object.entries(sessionsPerDay).map(([date, count]) => ({
+    date: date.slice(5),
+    fullDate: date,
+    sessions: count,
+  }));
 
-  const scoreBuckets = Object.entries(scoring.scoreDistribution).sort(([a], [b]) => {
-    const numA = parseInt(a.split("-")[0]);
-    const numB = parseInt(b.split("-")[0]);
-    return numA - numB;
-  });
-  const maxBucket = Math.max(...scoreBuckets.map(([, v]) => v), 1);
+  // Score distribution data for Recharts
+  const scoreChartData = Object.entries(scoring.scoreDistribution)
+    .sort(([a], [b]) => parseInt(a.split("-")[0]) - parseInt(b.split("-")[0]))
+    .map(([bucket, count]) => ({
+      bucket: `Score ${bucket}`,
+      shortBucket: bucket,
+      count,
+    }));
+
+  // Hiring recommendation pie chart data
+  const hiringPieColors: Record<string, string> = {
+    strong_hire: "#10b981",
+    hire: "#22c55e",
+    consider: "#f59e0b",
+    do_not_hire: "#f43f5e",
+    unknown: "#52525b",
+  };
+
+  const hiringChartData = Object.entries(hiringRecommendations)
+    .filter(([, v]) => v > 0)
+    .map(([key, value]) => ({
+      name: key.replace("_", " ").toUpperCase(),
+      value,
+      color: hiringPieColors[key] || "#71717a",
+    }));
 
   const totalRecs = Object.values(hiringRecommendations).reduce((a, b) => a + b, 0);
-  const totalQuality = Object.values(answerQualityDistribution).reduce((a, b) => a + b, 0);
+
+  // Answer quality chart data
+  const qualityChartData = Object.entries(answerQualityDistribution)
+    .filter(([, v]) => v > 0)
+    .map(([quality, count]) => ({
+      quality: quality.replace("_", " ").toUpperCase(),
+      count,
+    }));
 
   return (
     <div className="min-h-screen bg-[#09090b] text-[#fafafa] font-sans selection:bg-violet-500 selection:text-white pb-16">
@@ -228,13 +291,13 @@ export default function AdminDashboardPage() {
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <h1 className="text-xs font-bold text-white uppercase tracking-wider">Admin Executive Dashboard</h1>
+                <h1 className="text-xs font-bold text-white uppercase tracking-wider">Shadcn UI Analytics Dashboard</h1>
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-[9px] font-mono text-emerald-400">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
                   RESTRICTED
                 </span>
               </div>
-              <p className="text-[10px] text-zinc-400 font-mono">Intervia Research Telemetry v1.0</p>
+              <p className="text-[10px] text-zinc-400 font-mono">Intervia Recharts Telemetry v1.0</p>
             </div>
           </div>
         </div>
@@ -277,6 +340,7 @@ export default function AdminDashboardPage() {
               { id: "overview", label: "Platform Overview", icon: <Layers size={14} /> },
               { id: "scoring", label: "Scoring & Hiring", icon: <BarChart3 size={14} /> },
               { id: "research", label: "Research Metrics", icon: <Award size={14} /> },
+              { id: "snapshots", label: "Candidate Photos", icon: <Camera size={14} /> },
               { id: "network", label: "Network & Security", icon: <Globe size={14} /> },
             ].map((tab) => (
               <button
@@ -340,9 +404,8 @@ export default function AdminDashboardPage() {
               />
             </div>
 
-            {/* Performance Overview & Session Sparkline Chart */}
+            {/* Shadcn Recharts Area Chart: Daily Session Activity */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              {/* Daily Session Activity Chart (2 cols) */}
               <div className="lg:col-span-2 bg-[#141417] border border-white/10 rounded-2xl p-6 space-y-4 shadow-xl">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -350,60 +413,41 @@ export default function AdminDashboardPage() {
                       <Zap size={15} />
                     </div>
                     <div>
-                      <h3 className="text-sm font-bold text-white">Interview Session Velocity (30 Days)</h3>
-                      <p className="text-[11px] text-zinc-400">Daily candidate assessment volume</p>
+                      <h3 className="text-sm font-bold text-white">Shadcn UI Session Velocity Chart (30 Days)</h3>
+                      <p className="text-[11px] text-zinc-400">Recharts AreaChart telemetry curve</p>
                     </div>
                   </div>
                   <span className="text-[10px] font-mono px-2.5 py-1 rounded-full bg-white/5 border border-white/10 text-zinc-300">
-                    Max: {maxSessions} / day
+                    Recharts Dynamic Engine
                   </span>
                 </div>
 
-                {/* SVG Area Sparkline Chart */}
-                <div className="pt-4 space-y-2">
-                  <div className="relative h-44 w-full flex items-end">
-                    <svg className="w-full h-full overflow-visible" preserveAspectRatio="none">
-                      <defs>
-                        <linearGradient id="areaGradient" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="0%" stopColor="#8b5cf6" stopOpacity="0.4" />
-                          <stop offset="100%" stopColor="#8b5cf6" stopOpacity="0.0" />
-                        </linearGradient>
-                      </defs>
-                      {/* Grid Lines */}
-                      {[0, 0.25, 0.5, 0.75, 1].map((pct, idx) => (
-                        <line
-                          key={idx}
-                          x1="0"
-                          y1={`${pct * 100}%`}
-                          x2="100%"
-                          y2={`${pct * 100}%`}
-                          stroke="rgba(255,255,255,0.05)"
-                          strokeDasharray="4 4"
+                <div className="h-64 w-full pt-4">
+                  {isMounted && (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={sessionChartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                        <defs>
+                          <linearGradient id="colorVelocity" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.5} />
+                            <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+                        <XAxis dataKey="date" stroke="#71717a" fontSize={10} tickLine={false} />
+                        <YAxis stroke="#71717a" fontSize={10} tickLine={false} allowDecimals={false} />
+                        <Tooltip content={<ShadcnCustomTooltip />} />
+                        <Area
+                          type="monotone"
+                          dataKey="sessions"
+                          name="Candidate Sessions"
+                          stroke="#8b5cf6"
+                          strokeWidth={2.5}
+                          fillOpacity={1}
+                          fill="url(#colorVelocity)"
                         />
-                      ))}
-
-                      {/* Area Path */}
-                      <path
-                        d={buildAreaSvgPath(sessionDays, maxSessions)}
-                        fill="url(#areaGradient)"
-                      />
-
-                      {/* Line Path */}
-                      <path
-                        d={buildLineSvgPath(sessionDays, maxSessions)}
-                        fill="none"
-                        stroke="#8b5cf6"
-                        strokeWidth="2.5"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      />
-                    </svg>
-                  </div>
-                  <div className="flex justify-between text-[10px] text-zinc-500 font-mono pt-1">
-                    <span>{sessionDays[0]?.[0]}</span>
-                    <span>{sessionDays[Math.floor(sessionDays.length / 2)]?.[0]}</span>
-                    <span>{sessionDays[sessionDays.length - 1]?.[0]}</span>
-                  </div>
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  )}
                 </div>
               </div>
 
@@ -472,79 +516,72 @@ export default function AdminDashboardPage() {
 
             {/* Score Distribution & Hiring Recommendation */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {/* Score Distribution Histogram */}
+              {/* Shadcn Recharts Bar Chart: Score Distribution */}
               <div className="bg-[#141417] border border-white/10 rounded-2xl p-6 space-y-4 shadow-xl">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <div className="w-7 h-7 rounded-lg bg-violet-500/10 border border-violet-500/20 flex items-center justify-center text-violet-400">
                       <BarChart3 size={15} />
                     </div>
-                    <h3 className="text-sm font-bold text-white">Score Distribution Histogram</h3>
+                    <h3 className="text-sm font-bold text-white">Shadcn Score Distribution Bar Chart</h3>
                   </div>
                   <span className="text-[10px] font-mono text-zinc-400">N={platform.completedInterviews}</span>
                 </div>
 
-                <div className="space-y-3 pt-2">
-                  {scoreBuckets.length > 0 ? (
-                    scoreBuckets.map(([bucket, count]) => {
-                      const pct = Math.round((count / maxBucket) * 100);
-                      return (
-                        <div key={bucket} className="space-y-1">
-                          <div className="flex justify-between text-[11px] font-mono text-zinc-300">
-                            <span>Score {bucket}</span>
-                            <span>{count} candidates ({((count / (platform.completedInterviews || 1)) * 100).toFixed(0)}%)</span>
-                          </div>
-                          <div className="w-full bg-zinc-800/80 rounded-full h-3 overflow-hidden p-0.5 border border-white/5">
-                            <div
-                              className="h-full bg-gradient-to-r from-violet-600 via-indigo-500 to-cyan-400 rounded-full transition-all duration-500 shadow-sm"
-                              style={{ width: `${Math.max(pct, count > 0 ? 4 : 0)}%` }}
-                            />
-                          </div>
-                        </div>
-                      );
-                    })
-                  ) : (
-                    <p className="text-xs text-zinc-500 italic py-4">No completed score data recorded yet.</p>
+                <div className="h-64 w-full pt-2">
+                  {isMounted && (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={scoreChartData} margin={{ top: 10, right: 10, left: -20, bottom: 20 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+                        <XAxis dataKey="shortBucket" stroke="#71717a" fontSize={10} tickLine={false} />
+                        <YAxis stroke="#71717a" fontSize={10} tickLine={false} allowDecimals={false} />
+                        <Tooltip content={<ShadcnCustomTooltip />} />
+                        <Bar dataKey="count" name="Candidates" fill="#8b5cf6" radius={[6, 6, 0, 0]}>
+                          {scoreChartData.map((entry, index) => (
+                            <Cell key={`cell-${index}`} fill={index > 5 ? "#6366f1" : "#a855f7"} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
                   )}
                 </div>
               </div>
 
-              {/* Hiring Recommendation Breakdown */}
+              {/* Shadcn Recharts Pie/Donut Chart: Hiring Breakdown */}
               <div className="bg-[#141417] border border-white/10 rounded-2xl p-6 space-y-4 shadow-xl">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <div className="w-7 h-7 rounded-lg bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400">
-                      <Award size={15} />
+                      <PieChartIcon size={15} />
                     </div>
-                    <h3 className="text-sm font-bold text-white">Hiring Recommendation Breakdown</h3>
+                    <h3 className="text-sm font-bold text-white">Shadcn Hiring Donut Breakdown</h3>
                   </div>
                   <span className="text-[10px] font-mono text-zinc-400">Total: {totalRecs}</span>
                 </div>
 
-                <div className="space-y-4 pt-2">
-                  {[
-                    { key: "strong_hire", label: "Strong Hire", color: "bg-emerald-500", text: "text-emerald-400" },
-                    { key: "hire", label: "Hire", color: "bg-green-500", text: "text-green-400" },
-                    { key: "consider", label: "Consider", color: "bg-amber-500", text: "text-amber-400" },
-                    { key: "do_not_hire", label: "Do Not Hire", color: "bg-rose-500", text: "text-rose-400" },
-                  ].map(({ key, label, color, text }) => {
-                    const count = hiringRecommendations[key] || 0;
-                    const pct = totalRecs > 0 ? ((count / totalRecs) * 100).toFixed(0) : "0";
-                    return (
-                      <div key={key} className="space-y-1.5">
-                        <div className="flex justify-between items-center text-xs">
-                          <span className={`font-semibold ${text}`}>{label}</span>
-                          <span className="font-mono text-zinc-400">{count} ({pct}%)</span>
-                        </div>
-                        <div className="w-full bg-zinc-800/80 rounded-full h-3 overflow-hidden p-0.5 border border-white/5">
-                          <div
-                            className={`h-full ${color} rounded-full transition-all duration-500`}
-                            style={{ width: `${Math.max(Number(pct), count > 0 ? 4 : 0)}%` }}
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
+                <div className="h-64 w-full flex items-center justify-center relative">
+                  {isMounted && hiringChartData.length > 0 ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <PieChart>
+                        <Pie
+                          data={hiringChartData}
+                          cx="50%"
+                          cy="50%"
+                          innerRadius={60}
+                          outerRadius={85}
+                          paddingAngle={4}
+                          dataKey="value"
+                        >
+                          {hiringChartData.map((entry, index) => (
+                            <Cell key={`cell-${index}`} fill={entry.color} stroke="transparent" />
+                          ))}
+                        </Pie>
+                        <Tooltip content={<ShadcnCustomTooltip />} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <p className="text-xs text-zinc-500 italic">No hiring recommendations recorded yet.</p>
+                  )}
                 </div>
               </div>
             </div>
@@ -562,31 +599,22 @@ export default function AdminDashboardPage() {
                   <span className="text-[10px] font-mono text-zinc-400">{platform.totalQuestionsEvaluated} answers</span>
                 </div>
 
-                <div className="space-y-3 pt-2">
-                  {[
-                    { key: "excellent", label: "Excellent", color: "bg-emerald-500" },
-                    { key: "good", label: "Good", color: "bg-cyan-500" },
-                    { key: "fair", label: "Fair", color: "bg-amber-500" },
-                    { key: "poor", label: "Poor", color: "bg-rose-500" },
-                  ].map(({ key, label, color }) => {
-                    const count = answerQualityDistribution[key] || 0;
-                    const pct = totalQuality > 0 ? ((count / totalQuality) * 100).toFixed(0) : "0";
-                    return (
-                      <div key={key} className="space-y-1">
-                        <div className="flex justify-between text-[11px]">
-                          <span className="text-zinc-300 font-medium">{label}</span>
-                          <span className="font-mono text-zinc-400">{count} ({pct}%)</span>
-                        </div>
-                        <div className="w-full bg-zinc-800 rounded-full h-2.5 overflow-hidden">
-                          <div className={`h-full ${color} rounded-full`} style={{ width: `${pct}%` }} />
-                        </div>
-                      </div>
-                    );
-                  })}
+                <div className="h-48 w-full pt-2">
+                  {isMounted && qualityChartData.length > 0 && (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={qualityChartData} layout="vertical" margin={{ top: 5, right: 20, left: 20, bottom: 5 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+                        <XAxis type="number" stroke="#71717a" fontSize={10} tickLine={false} />
+                        <YAxis dataKey="quality" type="category" stroke="#71717a" fontSize={10} tickLine={false} width={80} />
+                        <Tooltip content={<ShadcnCustomTooltip />} />
+                        <Bar dataKey="count" name="Answers" fill="#06b6d4" radius={[0, 4, 4, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  )}
                 </div>
               </div>
 
-              <div className="bg-[#141417] border border-white/10 rounded-2xl p-6 space-y-4 shadow-xl">
+              <div className="bg-[#141417] border border-white/10 rounded-2xl p-6 space-y-4 shadow-xl flex flex-col justify-between">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <div className="w-7 h-7 rounded-lg bg-violet-500/10 border border-violet-500/20 flex items-center justify-center text-violet-400">
@@ -600,6 +628,10 @@ export default function AdminDashboardPage() {
                   <ConfidenceBadge label="High Confidence" count={skillConfidences.high} color="emerald" />
                   <ConfidenceBadge label="Medium Confidence" count={skillConfidences.medium} color="amber" />
                   <ConfidenceBadge label="Low Confidence" count={skillConfidences.low} color="rose" />
+                </div>
+
+                <div className="bg-white/5 border border-white/10 rounded-xl p-3 text-[11px] text-zinc-400 leading-relaxed">
+                  Evaluated across candidate project claims and live technical response depth.
                 </div>
               </div>
             </div>
@@ -730,7 +762,70 @@ export default function AdminDashboardPage() {
           </div>
         )}
 
-        {/* ── TAB 4: NETWORK & SECURITY ────────────────────────────────────── */}
+        {/* ── TAB 4: CANDIDATE PHOTOS ───────────────────────────────────────── */}
+        {activeTab === "snapshots" && (
+          <div className="space-y-6 animate-in fade-in duration-300">
+            <div className="bg-[#141417] border border-white/10 rounded-2xl p-6 space-y-6 shadow-xl">
+              <div className="flex items-center justify-between border-b border-white/10 pb-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-xl bg-violet-600/20 border border-violet-500/30 flex items-center justify-center text-violet-400">
+                    <Camera size={18} />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-bold text-white">Candidate Camera Snapshots</h3>
+                    <p className="text-xs text-zinc-400">Real-time webcam captures recorded during candidate interview sessions</p>
+                  </div>
+                </div>
+                <span className="px-3 py-1 rounded-full bg-violet-500/10 border border-violet-500/20 text-xs font-mono text-violet-300">
+                  {data.candidateSnapshots?.length || 0} Sessions Captured
+                </span>
+              </div>
+
+              {data.candidateSnapshots && data.candidateSnapshots.length > 0 ? (
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                  {data.candidateSnapshots.map((item) => (
+                    <div
+                      key={item.id}
+                      className="bg-[#09090b] border border-white/10 rounded-xl overflow-hidden shadow-lg flex flex-col justify-between hover:border-violet-500/40 transition-all group"
+                    >
+                      <div className="relative aspect-video bg-zinc-900 overflow-hidden flex items-center justify-center">
+                        {item.candidateSnapshot ? (
+                          <img
+                            src={item.candidateSnapshot}
+                            alt={item.candidateName}
+                            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                          />
+                        ) : (
+                          <div className="flex flex-col items-center gap-2 text-zinc-600">
+                            <Users size={28} />
+                            <span className="text-[10px] font-mono">No Photo Captured</span>
+                          </div>
+                        )}
+                        <div className="absolute top-2 right-2 px-2 py-0.5 rounded-md bg-black/70 backdrop-blur-md border border-white/10 text-[10px] font-mono text-zinc-300">
+                          {item.score !== null ? `${item.score}/100` : item.status}
+                        </div>
+                      </div>
+                      <div className="p-3.5 space-y-1 bg-[#141417]">
+                        <h4 className="text-xs font-bold text-white truncate">{item.candidateName}</h4>
+                        <p className="text-[11px] text-zinc-400 truncate">{item.jobRole}</p>
+                        <p className="text-[10px] text-zinc-500 font-mono pt-1">
+                          {new Date(item.createdAt).toLocaleDateString()} • {new Date(item.createdAt).toLocaleTimeString()}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-center py-12 space-y-3">
+                  <Camera size={36} className="text-zinc-600 mx-auto" />
+                  <p className="text-xs text-zinc-400">No candidate webcam snapshots recorded yet.</p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── TAB 5: NETWORK & SECURITY ────────────────────────────────────── */}
         {activeTab === "network" && (
           <div className="space-y-6 animate-in fade-in duration-300">
             <div className="bg-[#141417] border border-white/10 rounded-2xl p-6 space-y-6 shadow-xl">
@@ -811,7 +906,26 @@ export default function AdminDashboardPage() {
   );
 }
 
-// ── Helpers & Components ──────────────────────────────────────────────────────
+// ── Custom Shadcn Tooltip Component ──────────────────────────────────────────
+
+function ShadcnCustomTooltip({ active, payload, label }: any) {
+  if (active && payload && payload.length) {
+    return (
+      <div className="bg-[#141417] border border-white/15 rounded-xl p-3 shadow-2xl space-y-1 text-xs backdrop-blur-md">
+        <p className="text-[11px] font-mono text-zinc-400 uppercase">{label}</p>
+        {payload.map((entry: any, index: number) => (
+          <p key={`item-${index}`} className="font-bold text-white flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full" style={{ backgroundColor: entry.color || entry.fill }} />
+            <span>{entry.name}: {entry.value}</span>
+          </p>
+        ))}
+      </div>
+    );
+  }
+  return null;
+}
+
+// ── Sub-Components ───────────────────────────────────────────────────────────
 
 function StatCard({
   icon,
@@ -895,22 +1009,4 @@ function SummaryRow({ label, value, color }: { label: string; value: string; col
       <span className={`font-mono font-bold ${color}`}>{value}</span>
     </div>
   );
-}
-
-// ── SVG Path Builders for Sparkline ─────────────────────────────────────────
-
-function buildLineSvgPath(data: [string, number][], maxVal: number): string {
-  if (data.length === 0) return "";
-  const points = data.map(([, val], i) => {
-    const x = (i / (data.length - 1)) * 100;
-    const y = 100 - (val / Math.max(maxVal, 1)) * 85;
-    return `${x} ${y}`;
-  });
-  return `M ${points.join(" L ")}`;
-}
-
-function buildAreaSvgPath(data: [string, number][], maxVal: number): string {
-  if (data.length === 0) return "";
-  const linePath = buildLineSvgPath(data, maxVal);
-  return `${linePath} L 100 100 L 0 100 Z`;
 }

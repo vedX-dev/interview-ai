@@ -126,6 +126,7 @@ export async function GET(req: NextRequest) {
         createdAt: interviews.createdAt,
         jobRole: interviews.jobRole,
         geminiCallsCount: interviews.geminiCallsCount,
+        candidateSnapshot: interviews.candidateSnapshot,
       })
       .from(interviews)
       .where(eq(interviews.status, "completed"))
@@ -237,6 +238,31 @@ export async function GET(req: NextRequest) {
 
     // ── Response ──────────────────────────────────────────────────────────
 
+    // Fetch recent candidate snapshots for admin inspection
+    const recentSessions = await db
+      .select({
+        id: interviews.id,
+        jobRole: interviews.jobRole,
+        status: interviews.status,
+        score: interviews.score,
+        createdAt: interviews.createdAt,
+        candidateSnapshot: interviews.candidateSnapshot,
+        feedback: interviews.feedback,
+      })
+      .from(interviews)
+      .orderBy(desc(interviews.createdAt))
+      .limit(12);
+
+    const candidateSnapshots = recentSessions.map((s) => ({
+      id: s.id,
+      jobRole: s.jobRole,
+      status: s.status,
+      score: s.score,
+      createdAt: s.createdAt,
+      candidateSnapshot: s.candidateSnapshot,
+      candidateName: (s.feedback as any)?.candidateProfile?.fullName || "Candidate",
+    }));
+
     return NextResponse.json({
       platform: {
         totalInterviews,
@@ -260,6 +286,7 @@ export async function GET(req: NextRequest) {
       skillConfidences: allSkillConfidences,
       answerQualityDistribution: answerQualityDist,
       sessionsPerDay,
+      candidateSnapshots,
       clientNetwork: {
         clientIp: getClientIP(req),
         allowedIpsConfigured: allowedIPs.length > 0,

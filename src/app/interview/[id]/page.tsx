@@ -213,14 +213,47 @@ export default function InterviewRoomPage() {
   }, []);
 
   // ── Camera: attach srcObject AFTER the video element mounts ─────────────────
+  const snapshotCapturedRef = useRef(false);
+  const captureCandidateSnapshot = useCallback(() => {
+    if (!videoRef.current || !interviewId) return;
+    const video = videoRef.current;
+    if (video.videoWidth === 0 || video.videoHeight === 0) return;
+
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.min(video.videoWidth, 640);
+      canvas.height = Math.min(video.videoHeight, 480);
+      const ctx = canvas.getContext("2d");
+      if (ctx) {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
+        fetch(`/api/interviews/${interviewId}/snapshot`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ snapshot: dataUrl }),
+        }).catch((err) => console.warn("[SNAPSHOT] Upload error:", err));
+      }
+    } catch (e) {
+      console.warn("[SNAPSHOT] Capture failed:", e);
+    }
+  }, [interviewId]);
+
   useEffect(() => {
     if (videoRef.current && mediaStream) {
       videoRef.current.srcObject = mediaStream;
       videoRef.current.play().catch((e) =>
         console.warn("[WEBCAM] play() failed:", e),
       );
+
+      if (!snapshotCapturedRef.current) {
+        const timer = setTimeout(() => {
+          captureCandidateSnapshot();
+          snapshotCapturedRef.current = true;
+        }, 2500);
+        return () => clearTimeout(timer);
+      }
     }
-  }, [mediaStream]);
+  }, [mediaStream, captureCandidateSnapshot]);
 
   // ── Integrity Monitoring: Start detector ────────────────────────────────────
   useEffect(() => {

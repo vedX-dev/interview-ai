@@ -58,6 +58,8 @@ export const interviews = pgTable(
     adaptiveDecisionsCount: integer("adaptive_decisions_count").default(0),
     // Server-owned conversation state (brain) — replaces client-driven phase/turn tracking
     plan: jsonb("plan"),
+    // Candidate screenshot taken during interview
+    candidateSnapshot: text("candidate_snapshot"),
   },
   (table) => [index("interviews_resume_id_idx").on(table.resumeId)],
 );
