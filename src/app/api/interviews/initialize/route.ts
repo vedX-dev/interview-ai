@@ -21,6 +21,7 @@ import { ExtractedResumeSchema } from "@/src/schemas/resume";
 import { ConversationStateSchema } from "@/src/schemas/brain";
 import { checkInterviewCreate } from "@/src/lib/rate-limit";
 import { generateCoverageTopics } from "@/src/lib/interview/state";
+import { logEvent } from "@/src/lib/audit";
 import "@/src/lib/config";
 
 const InitializeRequestSchema = z.object({
@@ -31,13 +32,14 @@ const InitializeRequestSchema = z.object({
 
 export async function POST(req: NextRequest) {
   try {
-    const { userId } = await auth();
+    const { userId, sessionId } = await auth();
     if (!userId) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
     const rl = checkInterviewCreate(userId);
     if (!rl.allowed) {
+      logEvent(req, { userId, sessionId, type: "rate_limited", meta: { bucket: "interview_create" } });
       return NextResponse.json(
         { error: rl.reason, code: rl.code, retryAfterSec: rl.retryAfterSec },
         { status: 429, headers: { "Retry-After": String(rl.retryAfterSec ?? 60) } },
@@ -125,6 +127,13 @@ export async function POST(req: NextRequest) {
       interviewId: createdInterview.id,
       speaker: "ai",
       content: greeting,
+    });
+
+    logEvent(req, {
+      userId,
+      sessionId,
+      interviewId: createdInterview.id,
+      type: "init",
     });
 
     // ── Generate topics asynchronously (non-blocking) ────────────────────────

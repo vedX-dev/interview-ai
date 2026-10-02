@@ -24,6 +24,7 @@ import { interviews, transcriptChunks } from "@/src/db/schema";
 import { FeedbackReportSchema } from "@/src/schemas/feedback";
 import { generate, tryParseAndValidate } from "@/src/lib/llm/index";
 import { loadState } from "@/src/lib/interview/state";
+import { logEvent } from "@/src/lib/audit";
 import type { ConversationState, TurnScore, CoverageTopic } from "@/src/schemas/brain";
 
 // ─── System prompt ────────────────────────────────────────────────────────────
@@ -117,7 +118,7 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    const { userId } = await auth();
+    const { userId, sessionId } = await auth();
     if (!userId) {
       return NextResponse.json({ error: "Unauthorized", code: "AUTH_REQUIRED" }, { status: 401 });
     }
@@ -221,6 +222,17 @@ export async function POST(
         status: "completed",
       })
       .where(eq(interviews.id, interviewId));
+
+    logEvent(req, {
+      userId,
+      sessionId,
+      interviewId,
+      type: "feedback",
+      meta: {
+        score: validatedFeedback.overallScore,
+        recommendation: validatedFeedback.hiringRecommendation,
+      },
+    });
 
     return NextResponse.json(validatedFeedback);
   } catch (error) {

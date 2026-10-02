@@ -59,6 +59,7 @@ function makeLLMResponse(overrides: Partial<LLMTurnResponse> = {}): LLMTurnRespo
       strengths: [],
       gaps: [],
       facts: [],
+      openThread: null,
     },
     decision: {
       action: "followup",
@@ -158,6 +159,7 @@ console.log("══════════════════════�
       strengths: [],
       gaps: [],
       facts: [],
+      openThread: null,
     },
     decision: {
       action: "meta_acknowledge",
@@ -215,6 +217,7 @@ console.log("══════════════════════�
       strengths: [],
       gaps: [],
       facts: [],
+      openThread: null,
     },
     decision: { action: "clarify", nextTopic: null, reason: "answer was garbled" },
     say: "Could you elaborate a bit more on that?",

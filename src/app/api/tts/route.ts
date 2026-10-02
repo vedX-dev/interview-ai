@@ -15,6 +15,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createHash } from "crypto";
 import { logEvalLatency } from "@/src/eval/logger";
+import { logEvent } from "@/src/lib/audit";
+import { checkTtsLimit } from "@/src/lib/rate-limit";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -29,7 +31,7 @@ const CACHE_MAX_ENTRIES = 500;
 
 const TTSRequestSchema = z.object({
   text: z.string().min(1).max(MAX_TEXT_CHARS),
-  speaker: z.string().optional().default("aditya"),
+  speaker: z.string().optional().default("ritu"),
 });
 
 // ─── In-memory cache (hash → base64 audio chunks) ────────────────────────────
@@ -137,22 +139,42 @@ function chunkText(text: string, maxLen = MAX_CHUNK_CHARS): string[] {
   return chunks.length > 0 ? chunks : [text];
 }
 
+function fallbackResponse(req: NextRequest, userId: string, sessionId: string | null | undefined, reason: string) {
+  logEvent(req, {
+    userId,
+    sessionId,
+    type: "tts_fallback",
+    meta: { reason },
+  });
+  return NextResponse.json({ fallback: true, reason });
+}
+
 // ─── Route handler ────────────────────────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
+  let reqUserId = "";
+  let reqSessionId: string | null = null;
   try {
-    const { userId } = await auth();
+    const { userId, sessionId } = await auth();
     if (!userId) {
       return NextResponse.json({ error: "Unauthorized", code: "AUTH_REQUIRED" }, { status: 401 });
     }
+    reqUserId = userId;
+    reqSessionId = sessionId;
+
+    const rl = checkTtsLimit(userId);
+    if (!rl.allowed) {
+      logEvent(req, { userId, sessionId, type: "rate_limited", meta: { bucket: "tts" } });
+      return fallbackResponse(req, userId, sessionId, "TTS rate limit exceeded");
+    }
 
     const body = TTSRequestSchema.parse(await req.json());
-    const speaker = body.speaker ?? "aditya";
+    const speaker = body.speaker ?? "ritu";
 
     // Strip markdown / emoji / code before TTS
     const cleanText = stripForTTS(body.text);
     if (!cleanText) {
-      return NextResponse.json({ fallback: true, reason: "Text empty after preprocessing" });
+      return fallbackResponse(req, userId, sessionId, "Text empty after preprocessing");
     }
 
     const key = cacheKey(cleanText, speaker);
@@ -166,13 +188,13 @@ export async function POST(req: NextRequest) {
     // Budget check
     if (!checkAndDeductBudget(userId, cleanText.length)) {
       console.warn(`[TTS] Budget exceeded for user=${userId} len=${cleanText.length}`);
-      return NextResponse.json({ fallback: true, reason: "Daily TTS character budget reached" });
+      return fallbackResponse(req, userId, sessionId, "Daily TTS character budget reached");
     }
 
     const sarvamKey = process.env.SARVAM_API_KEY;
     if (!sarvamKey) {
       console.warn("[TTS] SARVAM_API_KEY not configured");
-      return NextResponse.json({ fallback: true, reason: "TTS service not configured" });
+      return fallbackResponse(req, userId, sessionId, "TTS service not configured");
     }
 
     const chunks = chunkText(cleanText);
@@ -211,10 +233,7 @@ export async function POST(req: NextRequest) {
       if (!resp.ok) {
         const errText = await resp.text().catch(() => "");
         console.warn(`[TTS] Sarvam returned ${resp.status}: ${errText.slice(0, 120)}`);
-        return NextResponse.json({
-          fallback: true,
-          reason: `Sarvam API error ${resp.status}`,
-        });
+        return fallbackResponse(req, userId, sessionId, `Sarvam API error ${resp.status}`);
       }
 
       const data = await resp.json();
@@ -233,7 +252,7 @@ export async function POST(req: NextRequest) {
     });
 
     if (audioResults.length === 0) {
-      return NextResponse.json({ fallback: true, reason: "No audio generated" });
+      return fallbackResponse(req, userId, sessionId, "No audio generated");
     }
 
     // Store in cache with LRU eviction
@@ -246,6 +265,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ audios: audioResults, cached: false, fallback: false });
   } catch (error: any) {
     console.error("[TTS] Unexpected error:", error?.message);
+    if (reqUserId) {
+      return fallbackResponse(req, reqUserId, reqSessionId, error?.message ?? "Unexpected TTS error");
+    }
     return NextResponse.json({
       fallback: true,
       reason: error?.message ?? "Unexpected TTS error",

@@ -21,6 +21,8 @@ import { db } from "@/src/db/index";
 import { resumes } from "@/src/db/schema";
 import { ExtractedResumeSchema, type ExtractedResume } from "@/src/schemas/resume";
 import { generate, tryParseAndValidate } from "@/src/lib/llm/index";
+import { checkParseResumeLimit } from "@/src/lib/rate-limit";
+import { logEvent } from "@/src/lib/audit";
 
 const MAX_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
 
@@ -141,9 +143,18 @@ function heuristicParse(text: string) {
 
 export async function POST(request: Request) {
   try {
-    const { userId } = await auth();
+    const { userId, sessionId } = await auth();
     if (!userId) {
       return Response.json({ error: "Unauthorized", code: "AUTH_REQUIRED" }, { status: 401 });
+    }
+
+    const rl = checkParseResumeLimit(userId);
+    if (!rl.allowed) {
+      logEvent(request, { userId, sessionId, type: "rate_limited", meta: { bucket: "parse_resume" } });
+      return Response.json(
+        { error: rl.reason, code: "RATE_LIMITED", retryAfterSec: rl.retryAfterSec ?? 60 },
+        { status: 429, headers: { "Retry-After": String(rl.retryAfterSec ?? 60) } },
+      );
     }
 
     let fileBuffer: Buffer;
@@ -271,6 +282,16 @@ export async function POST(request: Request) {
         structuredData: extractedResume,
       })
       .returning();
+
+    logEvent(request, {
+      userId,
+      sessionId,
+      type: "resume_parse",
+      meta: {
+        resumeId: savedResume.id,
+        fileType,
+      },
+    });
 
     return Response.json(savedResume);
   } catch (error) {

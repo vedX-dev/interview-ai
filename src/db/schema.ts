@@ -78,3 +78,25 @@ export const transcriptChunks = pgTable(
     index("transcript_chunks_interview_id_idx").on(table.interviewId),
   ],
 );
+
+export const auditEvents = pgTable(
+  "audit_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: text("user_id").notNull(),
+    interviewId: uuid("interview_id").references(() => interviews.id, {
+      onDelete: "cascade",
+    }),
+    clerkSessionId: text("clerk_session_id"),
+    type: text("type").notNull(),
+    ipHash: text("ip_hash"),
+    userAgent: text("user_agent"),
+    meta: jsonb("meta"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    index("audit_events_user_created_idx").on(table.userId, table.createdAt),
+    index("audit_events_interview_id_idx").on(table.interviewId),
+  ],
+);
+

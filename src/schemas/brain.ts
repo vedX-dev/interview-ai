@@ -69,6 +69,10 @@ export const ConversationStateSchema = z.object({
   scores: z.array(TurnScoreSchema).default([]),
   followUpsOnCurrent: z.number().int().min(0).default(0),
   turnCount: z.number().int().min(0).default(0),
+  /** Number of warmup turns completed so far */
+  warmupTurns: z.number().int().min(0).default(0),
+  /** Consecutive off-topic / smalltalk turns in core phase */
+  consecutiveSmalltalkCount: z.number().int().min(0).default(0),
   /** Unix ms timestamp when the interview actually started (post-greeting) */
   startedAt: z.number().optional(),
   /** Candidate first name extracted once at init */
@@ -89,7 +93,7 @@ export const ConversationStateSchema = z.object({
   candidateLang: z.enum(["en-IN", "hi-IN", "hinglish"]).default("en-IN"),
   /**
    * The open conversational thread being actively followed from the candidate's last answer.
-   * e.g. "pgvector usage in interview system" — set by answer-grounding logic, cleared on topic change.
+   * e.g. "built solo to give creators one mood-board space"
    */
   activeThread: z.string().optional(),
   /** How many consecutive turns have focused on the current activeThread */
@@ -133,6 +137,7 @@ export const TurnEvaluationSchema = z.object({
   strengths: z.array(z.string()).default([]),
   gaps: z.array(z.string()).default([]),
   facts: z.array(z.string()).default([]),
+  openThread: z.string().nullable().optional().default(null),
 });
 
 export const TurnDecisionSchema = z.object({

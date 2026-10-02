@@ -324,6 +324,7 @@ export default function InterviewRoomPage() {
 
     return () => {
       detector?.stop();
+      detector?.close();
     };
   }, [interviewId, mediaStream, router]);
 
@@ -511,7 +512,7 @@ export default function InterviewRoomPage() {
     const response = await fetch("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, speaker: "aditya" }),
+      body: JSON.stringify({ text, speaker: "ritu" }),
     });
 
     if (!response.ok) {
@@ -661,6 +662,14 @@ export default function InterviewRoomPage() {
         setTranscriptError(null);
         response = await attemptFetch();
         console.log("[TURN] Retry response status:", response.status);
+      }
+
+      if (response.status === 409) {
+        console.log("[TURN] Interview already ended on server (409). Navigating to feedback report.");
+        setIsAiThinking(false);
+        setCurrentPhase("closing");
+        await generateFeedback();
+        return;
       }
 
       if (!response.ok) {

@@ -18,7 +18,9 @@ import {
   ChevronUp,
   LayoutDashboard,
   HelpCircle,
+  Download,
 } from "lucide-react";
+import { generateFeedbackPdf } from "@/src/lib/pdf-export";
 
 interface FeedbackData {
   overallScore: number;
@@ -69,6 +71,19 @@ export default function InterviewFeedbackPage() {
   const [transcript, setTranscript] = useState<TranscriptChunk[]>([]);
   const [showTranscriptDrawer, setShowTranscriptDrawer] = useState(false);
   const [expandedQuestions, setExpandedQuestions] = useState<Record<number, boolean>>({});
+  const [isExportingPdf, setIsExportingPdf] = useState(false);
+
+  const handleDownloadPdf = () => {
+    if (!feedback) return;
+    setIsExportingPdf(true);
+    try {
+      generateFeedbackPdf(feedback, jobRole, interviewId || "session", transcript);
+    } catch (err) {
+      console.error("[PDF_EXPORT_ERROR]", err);
+    } finally {
+      setIsExportingPdf(false);
+    }
+  };
 
   useEffect(() => {
     if (!interviewId) return;
@@ -247,6 +262,14 @@ export default function InterviewFeedbackPage() {
 
         <div className="flex items-center gap-3">
           <button
+            onClick={handleDownloadPdf}
+            disabled={isExportingPdf}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600/20 border border-emerald-500/40 text-xs font-bold text-emerald-300 hover:bg-emerald-600/30 hover:border-emerald-500/60 transition-all shadow-sm disabled:opacity-50 cursor-pointer"
+          >
+            <Download size={14} className="text-emerald-400" />
+            <span>{isExportingPdf ? "Exporting PDF..." : "Download PDF"}</span>
+          </button>
+          <button
             onClick={() => setShowTranscriptDrawer(true)}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-xs font-medium text-zinc-300 hover:text-white hover:border-zinc-700 transition-colors"
           >
@@ -258,7 +281,7 @@ export default function InterviewFeedbackPage() {
             className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-xs font-bold text-white shadow-lg shadow-purple-600/20 transition-all"
           >
             <LayoutDashboard size={14} />
-            <span>Back to Dashboard</span>
+            <span>Dashboard</span>
           </Link>
         </div>
       </header>
@@ -298,13 +321,24 @@ export default function InterviewFeedbackPage() {
               </div>
             </div>
 
-            {/* Quick Action */}
-            <Link
-              href="/dashboard"
-              className="w-full md:w-auto px-6 py-3 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-bold transition-all text-center shadow-lg shadow-purple-600/30"
-            >
-              Back to Dashboard
-            </Link>
+            {/* Quick Actions */}
+            <div className="w-full md:w-auto flex flex-col sm:flex-row items-center gap-3">
+              <button
+                type="button"
+                onClick={handleDownloadPdf}
+                disabled={isExportingPdf}
+                className="w-full sm:w-auto flex items-center justify-center gap-2 px-5 py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold transition-all shadow-lg shadow-emerald-600/20 cursor-pointer disabled:opacity-50"
+              >
+                <Download size={16} />
+                <span>{isExportingPdf ? "Generating PDF..." : "Download PDF Report"}</span>
+              </button>
+              <Link
+                href="/dashboard"
+                className="w-full sm:w-auto px-6 py-3 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-200 rounded-xl text-xs font-bold transition-all text-center shadow-md"
+              >
+                Dashboard
+              </Link>
+            </div>
           </div>
         </section>
 
@@ -516,10 +550,19 @@ export default function InterviewFeedbackPage() {
         </section>
 
         {/* Bottom Navigation CTA */}
-        <div className="pt-4 pb-12 flex justify-center">
+        <div className="pt-4 pb-12 flex items-center justify-center gap-4">
+          <button
+            type="button"
+            onClick={handleDownloadPdf}
+            disabled={isExportingPdf}
+            className="flex items-center gap-2 px-6 py-3.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl shadow-lg shadow-emerald-600/30 transition-all text-sm cursor-pointer disabled:opacity-50"
+          >
+            <Download size={18} />
+            <span>{isExportingPdf ? "Generating PDF..." : "Download PDF Report"}</span>
+          </button>
           <Link
             href="/dashboard"
-            className="flex items-center gap-2 px-8 py-3.5 bg-purple-600 hover:bg-purple-500 text-white font-bold rounded-xl shadow-lg shadow-purple-600/30 transition-all text-sm"
+            className="flex items-center gap-2 px-6 py-3.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-bold rounded-xl shadow-md border border-zinc-700 transition-all text-sm"
           >
             <LayoutDashboard size={18} />
             <span>Back to Dashboard</span>

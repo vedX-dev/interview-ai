@@ -13,7 +13,7 @@ import { embedText } from "@/src/lib/gemini-embeddings";
 import { InterviewChatSchema } from "@/src/schemas/chat";
 import { generate } from "@/src/lib/llm/index";
 
-const RAG_SYSTEM = `You are an interview session assistant for InterviewAI.
+const RAG_SYSTEM = `You are an interview session assistant for Intervia.
 Answer the user's question using ONLY the transcript context provided below.
 If the context does not contain enough information, say so clearly.
 Keep answers concise, factual, and grounded in what was actually said during the interview.`;

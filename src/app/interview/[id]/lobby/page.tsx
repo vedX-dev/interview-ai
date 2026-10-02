@@ -2,7 +2,8 @@
 
 import { useEffect, useState, useRef } from "react";
 import { useRouter, useParams } from "next/navigation";
-import { Mic, MicOff, Volume2, VolumeX, CheckCircle, XCircle, ArrowRight, ArrowLeft, Camera, CameraOff, ShieldCheck, Eye } from "lucide-react";
+import { Mic, MicOff, Volume2, VolumeX, CheckCircle, XCircle, ArrowRight, ArrowLeft, Camera, CameraOff, ShieldCheck, Eye, RefreshCw } from "lucide-react";
+import { IntegrityDetector } from "@/src/lib/integrity/detector";
 
 export default function InterviewLobbyPage() {
   const params = useParams<{ id: string }>();
@@ -28,12 +29,15 @@ export default function InterviewLobbyPage() {
   const [isCalibrating, setIsCalibrating] = useState(false);
   const [isCalibrated, setIsCalibrated] = useState(false);
   const [calibrationProgress, setCalibrationProgress] = useState(0);
+  const [calibrationFeedback, setCalibrationFeedback] = useState<string | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const microphoneRef = useRef<MediaStream | null>(null);
   const recognitionRef = useRef<any>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const detectorRef = useRef<IntegrityDetector | null>(null);
 
   useEffect(() => {
     // Validate interview ID on mount
@@ -80,6 +84,17 @@ export default function InterviewLobbyPage() {
 
     validateInterview();
 
+    // Check if calibration baseline was previously stored for this interview
+    const storedCal = localStorage.getItem(`integrity_calibration_${interviewId}`);
+    if (storedCal) {
+      try {
+        const parsed = JSON.parse(storedCal);
+        if (parsed.baselineYaw !== undefined && parsed.baselinePitch !== undefined) {
+          setIsCalibrated(true);
+        }
+      } catch (e) {}
+    }
+
     // Initialize audio context on mount
     if (typeof window !== "undefined" && window.AudioContext) {
       audioContextRef.current = new AudioContext();
@@ -87,18 +102,50 @@ export default function InterviewLobbyPage() {
 
     return () => {
       if (microphoneRef.current) {
-        microphoneRef.current.getTracks().forEach(track => track.stop());
+        microphoneRef.current.getTracks().forEach((track) => track.stop());
       }
       if (cameraStream) {
-        cameraStream.getTracks().forEach(track => track.stop());
+        cameraStream.getTracks().forEach((track) => track.stop());
+      }
+      if (detectorRef.current) {
+        detectorRef.current.stop();
+        detectorRef.current.close();
+        detectorRef.current = null;
       }
     };
   }, [interviewId, router, cameraStream]);
 
-  // Dedicated effect to attach stream to video element when available
+  // Dedicated effect to attach stream to video element & initialize detector overlay
   useEffect(() => {
-    if (videoRef.current && cameraStream) {
+    if (videoRef.current && cameraStream && isCameraOn) {
       videoRef.current.srcObject = cameraStream;
+
+      let active = true;
+      const setupDetector = async () => {
+        if (!detectorRef.current) {
+          const detector = new IntegrityDetector({
+            onViolation: () => {}, // lobby violations stay client-side
+          });
+          const ok = await detector.initialize();
+          if (!active) {
+            detector.close();
+            return;
+          }
+          if (ok && videoRef.current) {
+            detector.start(videoRef.current);
+            if (canvasRef.current) {
+              detector.attachCanvas(canvasRef.current, "Candidate");
+            }
+            detectorRef.current = detector;
+          }
+        }
+      };
+
+      setupDetector();
+
+      return () => {
+        active = false;
+      };
     }
   }, [cameraStream, isCameraOn]);
 
@@ -109,7 +156,7 @@ export default function InterviewLobbyPage() {
       setMicPermission("granted");
       setIsMicOn(true);
       setError(null);
-      
+
       // Set up audio analyzer for level meter
       if (audioContextRef.current) {
         const source = audioContextRef.current.createMediaStreamSource(stream);
@@ -117,7 +164,7 @@ export default function InterviewLobbyPage() {
         analyser.fftSize = 256;
         source.connect(analyser);
         analyserRef.current = analyser;
-        
+
         updateAudioLevel();
       }
     } catch (err) {
@@ -156,6 +203,11 @@ export default function InterviewLobbyPage() {
 
   const toggleCamera = async () => {
     if (isCameraOn && cameraStream) {
+      if (detectorRef.current) {
+        detectorRef.current.stop();
+        detectorRef.current.close();
+        detectorRef.current = null;
+      }
       cameraStream.getTracks().forEach((track) => track.stop());
       setCameraStream(null);
       setIsCameraOn(false);
@@ -170,17 +222,16 @@ export default function InterviewLobbyPage() {
     const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
     const update = () => {
       if (!analyserRef.current) return;
-      
+
       analyserRef.current.getByteFrequencyData(dataArray);
       const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
       setAudioLevel(average);
-      
-      // Continue monitoring as long as mic permission is granted
+
       if (micPermission === "granted") {
         requestAnimationFrame(update);
       }
     };
-    
+
     update();
   };
 
@@ -192,7 +243,7 @@ export default function InterviewLobbyPage() {
 
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     const recognition = new SpeechRecognition();
-    
+
     recognition.continuous = false;
     recognition.interimResults = true;
     recognition.lang = "en-US";
@@ -208,10 +259,9 @@ export default function InterviewLobbyPage() {
         .map((result: any) => result[0])
         .map((result: any) => result.transcript)
         .join("");
-      
+
       setTranscript(interim);
-      
-      // Check if we got a final result
+
       const finalResult = event.results[event.results.length - 1];
       if (finalResult.isFinal) {
         setSttTested(true);
@@ -270,30 +320,56 @@ export default function InterviewLobbyPage() {
     window.speechSynthesis.speak(utterance);
   };
 
-  const run3sCalibration = () => {
-    if (!isCameraOn || cameraPermission !== "granted") {
-      setError("Please enable camera before starting baseline calibration.");
+  /**
+   * Run 3-second alignment calibration with strict >=80% qualifying frames rule
+   */
+  const run3sCalibration = async () => {
+    if (!isCameraOn || cameraPermission !== "granted" || !videoRef.current) {
+      setError("Please enable camera before starting alignment calibration.");
       return;
     }
+
     setIsCalibrating(true);
     setCalibrationProgress(0);
-    let step = 0;
-    const interval = setInterval(() => {
-      step += 10;
-      setCalibrationProgress(step);
-      if (step >= 100) {
-        clearInterval(interval);
-        setIsCalibrating(false);
-        setIsCalibrated(true);
-        const calData = {
-          baselineYaw: 0,
-          baselinePitch: 0,
-          timestamp: Date.now(),
-        };
-        localStorage.setItem(`integrity_calibration_${interviewId}`, JSON.stringify(calData));
-        console.log("[LOBBY] Baseline calibration stored:", calData);
+    setCalibrationFeedback(null);
+    setError(null);
+
+    try {
+      let detector = detectorRef.current;
+      if (!detector) {
+        detector = new IntegrityDetector({ onViolation: () => {} });
+        await detector.initialize();
+        detector.start(videoRef.current);
+        if (canvasRef.current) {
+          detector.attachCanvas(canvasRef.current, "Candidate");
+        }
+        detectorRef.current = detector;
       }
-    }, 300);
+
+      const calData = await detector.calibrateWindow(
+        videoRef.current,
+        3000,
+        (progressPercent, feedbackMsg) => {
+          setCalibrationProgress(progressPercent);
+          if (feedbackMsg) {
+            setCalibrationFeedback(feedbackMsg);
+          }
+        }
+      );
+
+      setIsCalibrated(true);
+      setIsCalibrating(false);
+      setCalibrationFeedback(null);
+      localStorage.setItem(`integrity_calibration_${interviewId}`, JSON.stringify(calData));
+      console.log("[LOBBY] Alignment baseline calibration stored:", calData);
+    } catch (err: any) {
+      console.warn("[LOBBY] Alignment calibration failed:", err);
+      setIsCalibrated(false);
+      setIsCalibrating(false);
+      setCalibrationProgress(0);
+      const feedbackMsg = err?.message || "Move to center & look at camera";
+      setCalibrationFeedback(feedbackMsg);
+    }
   };
 
   // Research Mode State
@@ -311,7 +387,6 @@ export default function InterviewLobbyPage() {
 
   const startInterview = () => {
     console.log("[LOBBY] Starting interview with ID:", interviewId);
-    console.log("[LOBBY] Route param ID:", params.id);
     router.push(`/interview/${interviewId}`);
   };
 
@@ -322,7 +397,7 @@ export default function InterviewLobbyPage() {
   return (
     <div className="h-dvh max-h-dvh w-full bg-black text-zinc-100 flex flex-col justify-between p-3 sm:p-4 overflow-hidden select-none">
       <div className="max-w-2xl w-full mx-auto flex-1 min-h-0 flex flex-col justify-between py-1 space-y-2">
-        {/* Top Navigation Header with Back Button */}
+        {/* Top Navigation Header */}
         <div className="flex items-center justify-between shrink-0">
           <button
             onClick={() => router.back()}
@@ -464,7 +539,11 @@ export default function InterviewLobbyPage() {
                     muted
                     className="w-full h-full object-cover object-center transform -scale-x-100"
                   />
-                  <div className="absolute top-2.5 left-2.5 flex items-center gap-1 px-2.5 py-1 rounded-full bg-black/60 backdrop-blur-md border border-green-500/30 text-[11px] text-green-400 font-medium">
+                  <canvas
+                    ref={canvasRef}
+                    className="absolute inset-0 w-full h-full pointer-events-none z-10"
+                  />
+                  <div className="absolute top-2.5 left-2.5 flex items-center gap-1 px-2.5 py-1 rounded-full bg-black/60 backdrop-blur-md border border-green-500/30 text-[11px] text-green-400 font-medium z-20">
                     <span className="h-1.5 w-1.5 rounded-full bg-green-500 animate-pulse" />
                     Live Camera {isCalibrated && "• Baseline Calibrated"}
                   </div>
@@ -485,22 +564,40 @@ export default function InterviewLobbyPage() {
               )}
             </div>
 
-            {/* Calibration Bar */}
+            {/* Alignment Calibration Bar & Realtime Feedback */}
             {cameraPermission === "granted" && isCameraOn && (
-              <div className="flex items-center justify-between bg-zinc-950/80 p-2 rounded-lg border border-zinc-800 text-xs mt-1">
-                <div className="flex items-center gap-2">
-                  <Eye size={14} className={isCalibrated ? "text-green-400" : "text-amber-400"} />
-                  <span className="text-zinc-300">
-                    {isCalibrated ? "Face Baseline Calibrated" : "3-Sec Alignment Calibration"}
-                  </span>
+              <div className="space-y-1.5 mt-1">
+                <div className="flex items-center justify-between bg-zinc-950/80 p-2 rounded-lg border border-zinc-800 text-xs">
+                  <div className="flex items-center gap-2">
+                    <Eye size={14} className={isCalibrated ? "text-green-400" : "text-amber-400"} />
+                    <span className="text-zinc-300">
+                      {isCalibrated ? "Face Baseline Calibrated" : "3-Sec Alignment Calibration"}
+                    </span>
+                  </div>
+                  <button
+                    onClick={run3sCalibration}
+                    disabled={isCalibrating}
+                    className="px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-white text-[11px] font-medium transition-colors disabled:opacity-50"
+                  >
+                    {isCalibrating ? `Calibrating (${calibrationProgress}%)` : isCalibrated ? "Recalibrate" : "Calibrate Alignment (3s)"}
+                  </button>
                 </div>
-                <button
-                  onClick={run3sCalibration}
-                  disabled={isCalibrating}
-                  className="px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-white text-[11px] font-medium transition-colors disabled:opacity-50"
-                >
-                  {isCalibrating ? `Calibrating (${calibrationProgress}%)` : isCalibrated ? "Recalibrate" : "Calibrate Alignment (3s)"}
-                </button>
+
+                {calibrationFeedback && (
+                  <div className="bg-amber-950/50 border border-amber-800/80 rounded-lg p-2.5 flex items-center justify-between text-xs text-amber-300 animate-fadeIn">
+                    <div className="flex items-center gap-2">
+                      <span className="h-2 w-2 rounded-full bg-amber-400 animate-ping shrink-0" />
+                      <span>Calibration feedback: <strong className="text-white">{calibrationFeedback}</strong></span>
+                    </div>
+                    <button
+                      onClick={run3sCalibration}
+                      className="ml-2 px-2.5 py-1 bg-amber-600/40 hover:bg-amber-600/60 rounded text-[11px] font-medium text-amber-100 border border-amber-500/50 transition-colors shrink-0 flex items-center gap-1"
+                    >
+                      <RefreshCw size={11} />
+                      <span>Retry</span>
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -525,7 +622,7 @@ export default function InterviewLobbyPage() {
             </div>
           </div>
 
-          {/* Research Mode Notice & Consent (Gated behind NEXT_PUBLIC_RESEARCH_MODE=true) */}
+          {/* Research Mode Consent */}
           {isResearchMode && (
             <div className="bg-purple-950/40 p-3 rounded-lg border border-purple-600/50 space-y-2">
               <div className="flex items-start gap-2">

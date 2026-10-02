@@ -15,6 +15,7 @@ import {
   type AskedQuestion,
   type TurnScore,
   type LLMTurnResponse,
+  type CandidateIntent,
 } from "@/src/schemas/brain";
 import type { ExtractedResume } from "@/src/schemas/resume";
 import { BRAIN_CONFIG } from "./brain-config";
@@ -36,7 +37,6 @@ export function loadState(planJson: unknown): ConversationState {
   }
   const result = ConversationStateSchema.safeParse(planJson);
   if (result.success) return result.data;
-  // Malformed plan → reset cleanly (log so we can catch regressions)
   console.warn("[BRAIN] ConversationState parse failed, resetting:", result.error.message);
   return ConversationStateSchema.parse({});
 }
@@ -54,11 +54,67 @@ export async function saveState(
   await db
     .update(interviews)
     .set({
-      plan: state as any, // stored in jsonb
+      plan: state as any,
       ...(extraFields?.currentPhase ? { currentPhase: extraFields.currentPhase as any } : {}),
       ...(extraFields?.status ? { status: extraFields.status as any } : {}),
     })
     .where(eq(interviews.id, interviewId));
+}
+
+// ─── Phase Transition Helper (Pure) ──────────────────────────────────────────
+
+export interface AdvancePhaseOptions {
+  candidateAskedToStart?: boolean;
+  lastIntent?: CandidateIntent;
+}
+
+/**
+ * Pure function: Evaluates and advances interview phase.
+ * Warmup ends when warmupTurns >= minWarmupTurns (3), extended up to maxWarmupTurns (5)
+ * if the candidate's last message was a question to the AI.
+ * Early exit occurs if the candidate explicitly asks to start and warmupTurns >= 2.
+ */
+export function advancePhase(
+  state: ConversationState,
+  options?: AdvancePhaseOptions,
+): ConversationState {
+  const nextState = structuredClone(state);
+
+  if (nextState.phase === "intro") {
+    nextState.phase = "warmup";
+    nextState.warmupTurns = 0;
+    nextState.startedAt = Date.now();
+    return nextState;
+  }
+
+  if (nextState.phase === "warmup") {
+    const turns = nextState.warmupTurns ?? 0;
+    const askedToStart = options?.candidateAskedToStart ?? false;
+    const lastIntent = options?.lastIntent;
+
+    // Early exit: candidate explicitly asks to start AND warmupTurns >= 2
+    const canEarlyExit = askedToStart && turns >= BRAIN_CONFIG.minWarmupTurnsEarlyExit;
+
+    // Extension: if candidate asked a question to AI on last turn, extend warmup by 1 turn (up to maxWarmupTurns)
+    const isQuestionToAi = lastIntent === "question_to_ai";
+    const requiredTurns = isQuestionToAi
+      ? Math.min(BRAIN_CONFIG.maxWarmupTurns, BRAIN_CONFIG.minWarmupTurns + 1)
+      : BRAIN_CONFIG.minWarmupTurns;
+
+    const meetsMinTurns = turns >= requiredTurns;
+    const hitsMaxTurns = turns >= BRAIN_CONFIG.maxWarmupTurns;
+
+    if (canEarlyExit || meetsMinTurns || hitsMaxTurns) {
+      nextState.phase = "core";
+      // Activate first topic on transition to core (bridge turn)
+      if (!nextState.coverage.some((t) => t.status === "active")) {
+        const { nextState: activatedState } = activateNextTopic(nextState);
+        return activatedState;
+      }
+    }
+  }
+
+  return nextState;
 }
 
 // ─── Topic generation (called once per interview) ─────────────────────────────
@@ -68,7 +124,7 @@ const TopicsResponseSchema = z.object({
     id: z.string(),
     label: z.string(),
     goal: z.string(),
-  })).min(4).max(8),
+  })).min(4).max(6),
 });
 
 export async function generateCoverageTopics(
@@ -76,15 +132,11 @@ export async function generateCoverageTopics(
   resume: ExtractedResume | null,
   seed: number = 0,
 ): Promise<CoverageTopic[]> {
-  // First, try KB-based topic selection (faster, no LLM call)
   const kbTopics = selectKBTopics(jobRole, resume, seed);
   if (kbTopics.length >= 4) {
-    // Shuffle by seed to vary topic order across interviews
     const shuffled = shuffleWithSeed(kbTopics, seed);
-    // Always keep background/motivation in the first 2 slots (natural conversation flow)
-    // but allow other openers when seed pushes for variety
     const reordered = reorderForSeed(shuffled, seed);
-    return reordered.map((t) => ({
+    return reordered.slice(0, BRAIN_CONFIG.maxCoreTopics).map((t) => ({
       id: t.id,
       label: t.label,
       goal: buildGoalFromKB(t),
@@ -93,7 +145,6 @@ export async function generateCoverageTopics(
     }));
   }
 
-  // Fall back to LLM-generated topics for unusual roles
   try {
     const result = await generate({
       task: "heavy",
@@ -105,9 +156,8 @@ export async function generateCoverageTopics(
     const parsed = tryParseAndValidate(result.text, TopicsResponseSchema);
     if (parsed.ok) {
       const rawTopics = (parsed.data as z.infer<typeof TopicsResponseSchema>).topics;
-      // Shuffle by seed
       const shuffled = shuffleWithSeed(rawTopics, seed);
-      return shuffled.map((t) => ({
+      return shuffled.slice(0, BRAIN_CONFIG.maxCoreTopics).map((t) => ({
         ...t,
         status: "todo" as const,
         followUps: 0,
@@ -118,29 +168,22 @@ export async function generateCoverageTopics(
     console.warn("[BRAIN] Topic generation LLM failed, using defaults:", (err as Error).message);
   }
 
-  // Fallback to default topic mix (shuffled by seed)
   const defaults = shuffleWithSeed(BRAIN_CONFIG.defaultTopics, seed);
-  return defaults.map((t) => ({
+  return defaults.slice(0, BRAIN_CONFIG.maxCoreTopics).map((t) => ({
     ...t,
     status: "todo" as const,
     followUps: 0,
   }));
 }
+
 // ─── Answer Signal Extraction ──────────────────────────────────────────────────
 
 export interface AnswerSignals {
-  /** Specific technologies, frameworks, services mentioned */
   technologies: string[];
-  /** Concrete claims or decisions (e.g. "used Kafka for 50k RPS") */
   claims: string[];
-  /** Brief mentions that need follow-up ("also used X", "and Y") */
   openThreads: string[];
 }
 
-/**
- * Lightweight extractor: identifies concrete technical signals in the latest answer.
- * Pure — no LLM call. Used to build the ACTIVE THREAD context block for answer-grounded follow-ups.
- */
 export function extractSignalsFromAnswer(utterance: string, knownFacts: string[]): AnswerSignals {
   if (!utterance || utterance.length < 8) return { technologies: [], claims: [], openThreads: [] };
 
@@ -169,14 +212,12 @@ export function extractSignalsFromAnswer(utterance: string, knownFacts: string[]
     if (matches) tech.push(...matches.map((m) => m.toLowerCase()));
   }
 
-  // Claim detection: sentences with numbers/percentages or strong action verbs
   const sentences = utterance.split(/[.!?;]/).map((s) => s.trim()).filter((s) => s.length > 10);
   const claimSignals = /\b(\d+[kKmMbBgGtT%]?|used|worked|built|designed|led|architected|reduced|increased|improved|migrated|scaled|deployed|solved|implemented|integrated|owned|created|managed|developed)\b/i;
   for (const s of sentences) {
     if (claimSignals.test(s)) claims.push(s.slice(0, 120));
   }
 
-  // Open thread detection: sentences with brief tech mentions + trailing connectors
   const openSignals = /\b(also|and|plus|additionally|etc\.?|among others|some other)\b/i;
   for (const s of sentences) {
     if (openSignals.test(s) && tech.some((t) => s.toLowerCase().includes(t))) {
@@ -184,7 +225,6 @@ export function extractSignalsFromAnswer(utterance: string, knownFacts: string[]
     }
   }
 
-  // Focus on NOVEL signals — filter out tech already in known facts
   const knownLower = knownFacts.join(" ").toLowerCase();
   const novelTech = [...new Set(tech)].filter((t) => !knownLower.includes(t));
 
@@ -197,7 +237,6 @@ export function extractSignalsFromAnswer(utterance: string, knownFacts: string[]
 
 // ─── Similarity check (repeated question guard) ───────────────────────────────
 
-/** Normalise text to lowercase tokens, strip punctuation */
 function tokenise(text: string): Set<string> {
   return new Set(
     text
@@ -208,7 +247,6 @@ function tokenise(text: string): Set<string> {
   );
 }
 
-/** Jaccard overlap of token sets */
 export function tokenOverlap(a: string, b: string): number {
   const setA = tokenise(a);
   const setB = tokenise(b);
@@ -221,7 +259,6 @@ export function tokenOverlap(a: string, b: string): number {
   return intersection / union;
 }
 
-/** Returns true if `question` is too similar to any previously asked question */
 export function isTooSimilar(question: string, asked: AskedQuestion[]): boolean {
   for (const prev of asked) {
     if (tokenOverlap(question, prev.question) >= BRAIN_CONFIG.similarityThreshold) {
@@ -233,7 +270,6 @@ export function isTooSimilar(question: string, asked: AskedQuestion[]): boolean 
 
 // ─── Phrase-Level Repeat Guard ───────────────────────────────────────────────
 
-/** Returns true if `say` opener (first 3 words) or full text matches any recent spoken reply */
 export function isPhraseRepeated(say: string, spokenReplies: string[]): boolean {
   const cleanSay = say.trim().toLowerCase();
   const words = cleanSay.split(/\s+/).filter(Boolean);
@@ -278,7 +314,7 @@ export interface DecisionResult {
 
 /**
  * Apply intent-first decision policy on top of LLM response.
- * Enforces caps, clarify ladder, professionalism nudges, and repeat guards.
+ * Enforces caps, clarify ladder, professionalism nudges, repeat guards, and minTurnsPerTopic pacing.
  */
 export function enforceDecisionPolicy(
   llmResponse: LLMTurnResponse,
@@ -303,7 +339,6 @@ export function enforceDecisionPolicy(
     currentState.unprofessionalCount = unproCount + 1;
 
     if (BRAIN_CONFIG.PROFESSIONALISM_NUDGE && unproCount === 0) {
-      // 1st time: polite boundary statement + continue
       return {
         action: "nudge",
         say: "Let's keep our focus professional, and I am glad to continue with our question.",
@@ -312,7 +347,6 @@ export function enforceDecisionPolicy(
         updatedState: currentState,
       };
     }
-    // 2nd+ time: quiet redirect without commenting
     return {
       action: "smalltalk_redirect",
       say: say || "Let's bring our discussion back to your engineering experience.",
@@ -322,33 +356,52 @@ export function enforceDecisionPolicy(
     };
   }
 
-  // 3. Candidate asked a question to AI / conversational permission request
-  // e.g. "can I ask you a question?", "can I ask something?", "can I clarify something?"
-  // → respond naturally and WAIT, do NOT continue the technical interview
+  // 3. WARMUP PHASE INTENT POLICY:
+  // In warmup, smalltalk / question_to_ai / meta NEVER become smalltalk_redirect or a generic redirect.
+  // Use the LLM's say (fallback only if empty).
+  if (currentState.phase === "warmup") {
+    if (
+      intent === "smalltalk" ||
+      intent === "question_to_ai" ||
+      intent === "meta" ||
+      intent === "offtopic"
+    ) {
+      return {
+        action: "meta_acknowledge",
+        say: say && say.trim().length > 3 ? say : "I'm glad to hear that! How has your day been going so far?",
+        shouldAdvanceTopic: false,
+        shouldEndInterview: false,
+        updatedState: currentState,
+      };
+    }
+  }
+
+  // 4. Candidate asked a question to AI / conversational permission request
   if (intent === "question_to_ai") {
     return {
       action: "meta_acknowledge",
       say: say.length > 5 ? say : "Of course, go ahead.",
       shouldAdvanceTopic: false,
       shouldEndInterview: false,
+      updatedState: currentState,
     };
   }
 
-  // 4. Candidate asked AI to repeat or meta comments ("why are you repeating")
+  // 5. Candidate asked AI to repeat or meta comments
   if (intent === "repeat_request" || intent === "meta" || decision.action === "meta_acknowledge") {
-    const activeTopic = currentState.coverage.find((t) => t.status === "active");
     const acknowledgeSay = say.length > 5
       ? say
-      : "Got it — let me rephrase our technical question.";
+      : "Got it — let me rephrase our question.";
     return {
       action: "meta_acknowledge",
       say: acknowledgeSay,
       shouldAdvanceTopic: false,
       shouldEndInterview: false,
+      updatedState: currentState,
     };
   }
 
-  // 4. Genuine garble / acoustic corruption → Clarify ladder
+  // 6. Genuine garble / acoustic corruption → Clarify ladder
   if (intent === "garbled" || evaluation.unclearOrGarbled || decision.action === "clarify") {
     const { say: clarifySay, nextState } = getClarifyUtterance(currentState);
     return {
@@ -360,19 +413,42 @@ export function enforceDecisionPolicy(
     };
   }
 
-  // 5. Off-topic / small talk
+  // 7. CORE PHASE: Off-topic / smalltalk handling
+  // In core, smalltalk_redirect ONLY after two consecutive off-topic/smalltalk turns.
   if (intent === "offtopic" || intent === "smalltalk" || evaluation.offTopic || decision.action === "smalltalk_redirect") {
+    const consec = (currentState.consecutiveSmalltalkCount || 0) + 1;
+    currentState.consecutiveSmalltalkCount = consec;
+
+    if (consec < 2) {
+      return {
+        action: "meta_acknowledge",
+        say: say || "That makes sense!",
+        shouldAdvanceTopic: false,
+        shouldEndInterview: false,
+        updatedState: currentState,
+      };
+    }
+
     return {
       action: "smalltalk_redirect",
-      say: say || "I'd love to stay focused on your technical experience today.",
+      say: say || "I'd love to bring our focus back to your engineering experience.",
       shouldAdvanceTopic: false,
       shouldEndInterview: false,
+      updatedState: currentState,
     };
   }
 
-  // 6. Check follow-up caps on answers/partials
+  // Reset consecutive smalltalk counter on scorable technical answer
+  if (intent === "answer" || intent === "partial") {
+    currentState.consecutiveSmalltalkCount = 0;
+  }
+
+  // 8. Check follow-up caps and minTurnsPerTopic on answers/partials
   const activeTopic = currentState.coverage.find((t) => t.status === "active");
   const followUpsOnCurrent = currentState.followUpsOnCurrent;
+  const turnsOnCurrentTopic = (activeTopic?.followUps ?? 0) + 1; // 1 main question + followUps
+  const minTurnsMet = turnsOnCurrentTopic >= BRAIN_CONFIG.minTurnsPerTopic;
+
   const maxFollowUps =
     evaluation.confidence < 0.6
       ? BRAIN_CONFIG.maxFollowUpsLowConfidence
@@ -384,21 +460,44 @@ export function enforceDecisionPolicy(
       say,
       shouldAdvanceTopic: true,
       shouldEndInterview: false,
+      updatedState: currentState,
     };
   }
 
-  // 7. Score-based override for evaluated answers
+  // 9. Score-based override for evaluated answers
   const scoreVal = evaluation.score ?? 5;
   if (decision.action === "next_topic" || decision.action === "followup" || decision.action === "wrapup") {
-    if (scoreVal >= BRAIN_CONFIG.scoreForNextTopic && evaluation.confidence >= BRAIN_CONFIG.confidenceForNextTopic) {
+    // Score >= 7 override MUST respect minTurnsPerTopic!
+    if (
+      scoreVal >= BRAIN_CONFIG.scoreForNextTopic &&
+      evaluation.confidence >= BRAIN_CONFIG.confidenceForNextTopic &&
+      minTurnsMet
+    ) {
       if (decision.action !== "wrapup") {
         return {
           action: "next_topic",
           say,
           shouldAdvanceTopic: true,
           shouldEndInterview: false,
+          updatedState: currentState,
         };
       }
+    }
+
+    // If score >= 7 but minTurnsPerTopic is NOT met yet, ask follow-up instead of skipping early!
+    if (
+      scoreVal >= BRAIN_CONFIG.scoreForNextTopic &&
+      !minTurnsMet &&
+      followUpsOnCurrent < maxFollowUps &&
+      activeTopic
+    ) {
+      return {
+        action: "followup",
+        say,
+        shouldAdvanceTopic: false,
+        shouldEndInterview: false,
+        updatedState: currentState,
+      };
     }
 
     if (
@@ -412,12 +511,13 @@ export function enforceDecisionPolicy(
         say,
         shouldAdvanceTopic: false,
         shouldEndInterview: false,
+        updatedState: currentState,
       };
     }
   }
 
   if (decision.action === "wrapup") {
-    return { action: "wrapup", say, shouldAdvanceTopic: false, shouldEndInterview: false };
+    return { action: "wrapup", say, shouldAdvanceTopic: false, shouldEndInterview: false, updatedState: currentState };
   }
 
   return {
@@ -425,16 +525,12 @@ export function enforceDecisionPolicy(
     say,
     shouldAdvanceTopic: decision.action === "next_topic",
     shouldEndInterview: false,
+    updatedState: currentState,
   };
 }
 
 // ─── State mutation helpers (Pure & Idempotent) ──────────────────────────────
 
-/**
- * Pure function: Marks the first "todo" topic as "active".
- * Idempotent: if a topic is already "active", returns it without changing state.
- * Never mutates `state`. Returns `{ nextState, activatedTopic }`.
- */
 export function activateNextTopic(state: ConversationState): {
   nextState: ConversationState;
   activatedTopic: CoverageTopic | null;
@@ -454,11 +550,6 @@ export function activateNextTopic(state: ConversationState): {
   return { nextState, activatedTopic: nextState.coverage[nextIdx] };
 }
 
-/**
- * Pure function: Marks current active topic as done, records score.
- * Idempotent: if no topic is active, returns nextState unchanged.
- * Never mutates `state`. Returns updated `ConversationState`.
- */
 export function closeActiveTopic(
   state: ConversationState,
   score: number,
@@ -476,7 +567,6 @@ export function closeActiveTopic(
   return nextState;
 }
 
-/** Get a fallback utterance when ALL LLMs fail (uses multi-phrasing bank) */
 export function getFallbackUtterance(state: ConversationState): string {
   const asked = new Set(state.asked.map((a) => a.topic));
 
@@ -499,15 +589,6 @@ export function getFallbackUtterance(state: ConversationState): string {
 
 // ─── K-Score Update (Phase 2: Adaptive Difficulty) ────────────────────────────
 
-/**
- * Update the rolling K-Score using exponential weighted average.
- * Only called for scorable intents (answer | partial).
- *
- * @param currentKScore - Current K-score (0-10)
- * @param newScore - This turn's score (0-10)
- * @param recentScores - Recent per-turn scores for trend detection
- * @returns Updated { kScore, kScoreTrend }
- */
 export function updateKScore(
   currentKScore: number,
   newScore: number,
@@ -515,10 +596,8 @@ export function updateKScore(
 ): { kScore: number; kScoreTrend: KScoreTrend } {
   const { alpha, strongTurnThreshold, weakTurnThreshold, risingRunLength, fallingRunLength } = KSCORE_CONFIG;
 
-  // EWA update
   const kScore = Math.max(0, Math.min(10, alpha * newScore + (1 - alpha) * currentKScore));
 
-  // Trend detection on last N scores
   const window = [...recentScores, newScore].slice(-Math.max(risingRunLength, fallingRunLength));
   const lastN = window.slice(-risingRunLength);
   const allStrong = lastN.length >= risingRunLength && lastN.every((s) => s >= strongTurnThreshold);
@@ -529,15 +608,6 @@ export function updateKScore(
   return { kScore, kScoreTrend };
 }
 
-/**
- * Compute the target depth for the next question based on kScore + kScoreTrend.
- * Called once per turn before building the context block.
- *
- * @param kScore - Current K-score
- * @param kScoreTrend - Current trend
- * @param turnsOnCurrentTopic - How many turns spent on the current topic
- * @returns "easy" | "medium" | "hard"
- */
 export function computeTargetDepth(
   kScore: number,
   kScoreTrend: KScoreTrend,
@@ -545,7 +615,6 @@ export function computeTargetDepth(
 ): TargetDepth {
   const { hardDepthMinScore, mediumDepthMinScore, risingTrendBoost, fallingTrendDampener } = KSCORE_CONFIG;
 
-  // Adjust thresholds based on trend
   const trendAdjust = kScoreTrend === "rising" ? -risingTrendBoost : kScoreTrend === "falling" ? fallingTrendDampener : 0;
 
   const effectiveHard = hardDepthMinScore + trendAdjust;
@@ -556,10 +625,6 @@ export function computeTargetDepth(
   return "easy";
 }
 
-/**
- * Compute average word count of recent candidate answers for length adaptation.
- * Returns the average, or 0 if no data.
- */
 export function computeAvgAnswerLength(recentTranscript: Array<{ speaker: string; content: string }>): number {
   const userTurns = recentTranscript
     .filter((e) => e.speaker === "user")
@@ -571,12 +636,10 @@ export function computeAvgAnswerLength(recentTranscript: Array<{ speaker: string
 
 // ─── Topic shuffle helpers (Phase 1 seed-based variation) ────────────────────
 
-/** Deterministic Fisher-Yates shuffle seeded by a numeric seed. */
 function shuffleWithSeed<T>(arr: readonly T[], seed: number): T[] {
   const copy = [...arr];
   let s = seed;
   for (let i = copy.length - 1; i > 0; i--) {
-    // LCG-style pseudo random
     s = (s * 1664525 + 1013904223) & 0xffffffff;
     const j = Math.abs(s) % (i + 1);
     [copy[i], copy[j]] = [copy[j], copy[i]];
@@ -584,16 +647,9 @@ function shuffleWithSeed<T>(arr: readonly T[], seed: number): T[] {
   return copy;
 }
 
-/**
- * Reorder topics so background/motivation is not ALWAYS turn 1.
- * When seed % 3 === 0 → background first (natural HR flow)
- * When seed % 3 === 1 → most recent project first (skip biography)
- * When seed % 3 === 2 → keep shuffle order (arbitrary start)
- */
 function reorderForSeed<T extends { id: string }>(topics: T[], seed: number): T[] {
   const mode = seed % 3;
   if (mode === 0) {
-    // Background first
     const bgIdx = topics.findIndex((t) => t.id === "background_motivation" || t.id === "background");
     if (bgIdx > 0) {
       const reordered = [...topics];
@@ -602,7 +658,6 @@ function reorderForSeed<T extends { id: string }>(topics: T[], seed: number): T[
       return reordered;
     }
   } else if (mode === 1) {
-    // Project first — background moves to slot 2
     const projIdx = topics.findIndex((t) => t.id.includes("project"));
     if (projIdx > 0) {
       const reordered = [...topics];
@@ -611,22 +666,18 @@ function reorderForSeed<T extends { id: string }>(topics: T[], seed: number): T[
       return reordered;
     }
   }
-  // mode === 2: keep shuffle order
   return topics;
 }
 
-/** Build a goal string from KB entry concepts for use as a CoverageTopic.goal */
 function buildGoalFromKB(entry: import("./knowledge-base/types").KnowledgeTopicEntry): string {
   return `Probe: ${entry.concepts.slice(0, 3).join(", ")}. Signal of strength: ${entry.signalsOfStrength[0]}.`;
 }
 
-/** Get the opening template instruction for the current interview seed */
 export function getOpeningTemplate(seed: number): string {
   const templates = BRAIN_CONFIG.openingTemplates;
   return templates[seed % templates.length];
 }
 
-/** Get seed-based fallback phrasing (never repeats same phrasing for the same account) */
 export function getSeedFallbackUtterance(state: ConversationState): string {
   const seed = state.conversationSeed ?? 0;
   const asked = new Set(state.asked.map((a) => a.topic));
@@ -640,7 +691,6 @@ export function getSeedFallbackUtterance(state: ConversationState): string {
   for (const fb of BRAIN_CONFIG.fallbackQuestions) {
     if (!asked.has(fb.topic)) {
       const phrasings = fb.phrasings as readonly string[];
-      // Use seed + turnCount for rotation so neither account nor turn repeats same phrasing
       const phrasingIdx = (seed + state.turnCount) % phrasings.length;
       return phrasings[phrasingIdx];
     }

@@ -7,6 +7,7 @@ import { interviews } from "@/src/db/schema";
 import { IntegrityEventSchema, type IntegrityEvent } from "@/src/schemas/integrity";
 import { checkIntegrityLimit } from "@/src/lib/rate-limit";
 import { INTEGRITY_CONFIG } from "@/src/lib/integrity/config";
+import { logEvent } from "@/src/lib/audit";
 import "@/src/lib/config";
 
 /** Server-side dedup: key = interviewId + type + timestamp (ms, bucketed to nearest 2s) */
@@ -32,7 +33,7 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    const { userId } = await auth();
+    const { userId, sessionId } = await auth();
     if (!userId) {
       return NextResponse.json({ error: "Unauthorized", code: "UNAUTHORIZED" }, { status: 401 });
     }
@@ -42,6 +43,7 @@ export async function POST(
     // Rate limit: per-interview bucket, NOT the interview-creation bucket
     const rl = checkIntegrityLimit(interviewId);
     if (!rl.allowed) {
+      logEvent(req, { userId, sessionId, interviewId, type: "rate_limited", meta: { bucket: "integrity" } });
       return NextResponse.json(
         { error: "Too many integrity events — please wait.", code: "RATE_LIMITED", retryAfterSec: rl.retryAfterSec ?? 10 },
         { status: 429, headers: { "Retry-After": String(rl.retryAfterSec ?? 10) } },
@@ -133,6 +135,17 @@ export async function POST(
     console.log(
       `[INTEGRITY_API] interview=${interviewId} type=${eventPayload.type} strikes=${serverStrikes} terminated=${isTerminated}`,
     );
+
+    logEvent(req, {
+      userId,
+      sessionId,
+      interviewId,
+      type: `integrity:${eventPayload.type}`,
+      meta: {
+        violationType: eventPayload.type,
+        strikeCount: serverStrikes,
+      },
+    });
 
     return NextResponse.json({
       success: true,

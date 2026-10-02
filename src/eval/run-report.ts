@@ -179,7 +179,7 @@ export function runFullReport(): void {
 
   // Print Terminal Output
   console.log("\n=======================================================");
-  console.log("    INTERVIEWAI AGGREGATE EVALUATION REPORT (TABLE 7)   ");
+  console.log("    INTERVIA AGGREGATE EVALUATION REPORT (TABLE 7)   ");
   console.log("=======================================================");
   console.log("| Performance Measure             | Result                                                  |");
   console.log("|---------------------------------|---------------------------------------------------------|");
@@ -190,7 +190,7 @@ export function runFullReport(): void {
 
   // Write STATISTICS.md
   const statsMdPath = path.join(docsDir, "STATISTICS.md");
-  let mdContent = `# InterviewAI Evaluation & Performance Statistics Report
+  let mdContent = `# Intervia Evaluation & Performance Statistics Report
 
 *Generated on ${new Date().toISOString()}*
 

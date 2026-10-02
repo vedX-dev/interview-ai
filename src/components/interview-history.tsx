@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Clock, Award, ArrowRight, CheckCircle2, AlertCircle, History, Sparkles } from "lucide-react";
+import { Clock, ArrowRight, History } from "lucide-react";
 
 interface InterviewSummary {
   id: string;
@@ -41,11 +41,11 @@ export function InterviewHistory() {
 
   if (loading) {
     return (
-      <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-2xl p-6 animate-pulse">
-        <div className="h-5 bg-zinc-800 rounded w-48 mb-4" />
+      <div className="glass-card rounded-2xl p-6 animate-pulse">
+        <div className="h-5 bg-white/10 rounded w-48 mb-4" />
         <div className="space-y-3">
-          <div className="h-16 bg-zinc-800/60 rounded-xl" />
-          <div className="h-16 bg-zinc-800/60 rounded-xl" />
+          <div className="h-16 bg-white/5 rounded-xl" />
+          <div className="h-16 bg-white/5 rounded-xl" />
         </div>
       </div>
     );
@@ -56,13 +56,13 @@ export function InterviewHistory() {
   }
 
   return (
-    <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-2xl p-6 space-y-4 shadow-xl">
+    <div className="glass-card rounded-2xl p-6 space-y-4 shadow-xl border border-white/10">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <History className="w-5 h-5 text-purple-400" />
-          <h2 className="text-base font-bold text-white">Recent Interview Session</h2>
+          <History className="w-4 h-4 text-zinc-400" />
+          <h2 className="text-base font-semibold text-white">Recent Interview Sessions</h2>
         </div>
-        <span className="text-xs text-zinc-500 font-mono">Latest Session</span>
+        <span className="text-xs text-zinc-500 font-mono">Latest Activity</span>
       </div>
 
       <div className="space-y-3">
@@ -74,15 +74,15 @@ export function InterviewHistory() {
           return (
             <div
               key={item.id}
-              className="bg-zinc-950/80 border border-zinc-800/80 hover:border-zinc-700 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 transition-all group"
+              className="bg-[#141417]/80 border border-white/10 hover:border-white/20 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 transition-all group"
             >
               <div className="space-y-1">
                 <div className="flex items-center gap-2">
-                  <h3 className="text-sm font-bold text-zinc-100 group-hover:text-purple-300 transition-colors">
+                  <h3 className="text-sm font-semibold text-zinc-100 group-hover:text-white transition-colors">
                     {item.jobRole}
                   </h3>
                   <span
-                    className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase border ${
+                    className={`text-[10px] font-mono px-2 py-0.5 rounded-full uppercase border ${
                       isCompleted
                         ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
                         : "bg-amber-500/10 text-amber-400 border-amber-500/30"
@@ -91,7 +91,7 @@ export function InterviewHistory() {
                     {isCompleted ? "Completed" : "In Progress"}
                   </span>
                   {rec && (
-                    <span className="text-[10px] font-mono text-zinc-400 bg-zinc-900 px-2 py-0.5 rounded border border-zinc-800">
+                    <span className="text-[10px] font-mono text-zinc-400 bg-white/5 px-2 py-0.5 rounded border border-white/10">
                       {rec.replace("_", " ").toUpperCase()}
                     </span>
                   )}
@@ -114,17 +114,7 @@ export function InterviewHistory() {
                 {score !== null && score !== undefined && (
                   <div className="text-right">
                     <div className="text-xs text-zinc-400 font-medium">Score</div>
-                    <div
-                      className={`text-lg font-extrabold ${
-                        score >= 85
-                          ? "text-emerald-400"
-                          : score >= 70
-                          ? "text-green-400"
-                          : score >= 50
-                          ? "text-amber-400"
-                          : "text-rose-400"
-                      }`}
-                    >
+                    <div className="text-lg font-bold text-white">
                       {score}/100
                     </div>
                   </div>
@@ -132,7 +122,7 @@ export function InterviewHistory() {
 
                 <Link
                   href={`/interview/${item.id}/feedback`}
-                  className="flex items-center gap-1.5 px-3.5 py-2 bg-zinc-800 hover:bg-purple-600 text-zinc-200 hover:text-white rounded-lg text-xs font-semibold transition-all shadow-sm"
+                  className="flex items-center gap-1.5 px-3.5 py-2 bg-white text-black hover:bg-zinc-200 rounded-lg text-xs font-semibold transition-all shadow-sm"
                 >
                   <span>View Report</span>
                   <ArrowRight size={13} />

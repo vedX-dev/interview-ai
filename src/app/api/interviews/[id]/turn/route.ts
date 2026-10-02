@@ -20,7 +20,7 @@ import { after } from "next/server";
 import { NextRequest, NextResponse } from "next/server";
 import { ZodError } from "zod";
 import { db } from "@/src/db/index";
-import { interviews, transcriptChunks } from "@/src/db/schema";
+import { interviews } from "@/src/db/schema";
 import {
   TurnRequestSchema,
   LLMTurnResponseSchema,
@@ -33,6 +33,7 @@ import { generate, tryParseAndValidate } from "@/src/lib/llm/index";
 import {
   loadState,
   saveState,
+  advancePhase,
   isTooSimilar,
   isPhraseRepeated,
   enforceDecisionPolicy,
@@ -52,6 +53,7 @@ import { BRAIN_CONFIG } from "@/src/lib/interview/brain-config";
 import { checkTurnLimit, isReplayedRequest } from "@/src/lib/rate-limit";
 import { getKBEntry } from "@/src/lib/interview/knowledge-base/index";
 import { logEvalLatency } from "@/src/eval/logger";
+import { logEvent } from "@/src/lib/audit";
 
 const IS_DEV = process.env.NODE_ENV !== "production";
 
@@ -63,21 +65,22 @@ export async function POST(
 
   try {
     // ── 1. Auth ──────────────────────────────────────────────────────────────
-    const { userId } = await auth();
+    const { userId, sessionId } = await auth();
     if (!userId) {
       return NextResponse.json({ error: "Unauthorized", code: "AUTH_REQUIRED" }, { status: 401 });
     }
 
+    const { id: interviewId } = await params;
+
     const rl = checkTurnLimit(userId);
     if (!rl.allowed) {
-      // Friendly 429 — never show "5 interviews per hour" during an interview
+      logEvent(req, { userId, sessionId, interviewId, type: "rate_limited", meta: { bucket: "turn" } });
       return NextResponse.json(
         { error: "One moment — please try again shortly.", code: "RATE_LIMITED", retryAfterSec: rl.retryAfterSec ?? 5 },
         { status: 429, headers: { "Retry-After": String(rl.retryAfterSec ?? 5) } },
       );
     }
 
-    const { id: interviewId } = await params;
     const body = TurnRequestSchema.parse(await req.json());
 
     // ── 2. Load interview + server state ─────────────────────────────────────
@@ -104,7 +107,6 @@ export async function POST(
       return NextResponse.json({ error: "Interview already ended", code: "ALREADY_ENDED" }, { status: 409 });
     }
 
-    // Parse state (server-owned — never trust client phase)
     let state: ConversationState = loadState(interview.plan);
 
     logEvalLatency({
@@ -115,17 +117,14 @@ export async function POST(
     });
 
     // ── Idempotency Check ──────────────────────────────────────────────────
-    // requestId uses interviewId + turnCount + short hash of content (no raw utterance text in logs)
     const utteranceHash = body.userUtterance.split('').reduce((h, c) => (Math.imul(31, h) + c.charCodeAt(0)) | 0, 0).toString(36).slice(-6);
     const requestId = body.clientRequestId || `${interviewId}_t${state.turnCount}_${utteranceHash}`;
 
-    // If this is a pure replay, return cached and don't count against any limit
     if (isReplayedRequest(requestId) && state.lastRequestId === requestId && state.lastResponse) {
       console.log(`[TURN] Idempotent replay '${requestId}' — returning cached reply`);
       return NextResponse.json(state.lastResponse);
     }
 
-    // Extract resume from feedback.candidateProfile (set during initialize)
     let resume = null;
     try {
       const feedbackObj = interview.feedback as Record<string, unknown> | null;
@@ -135,61 +134,59 @@ export async function POST(
       }
     } catch { }
 
-    // ── 3. First-turn bootstrap ───────────────────────────────────────────────
-    // If coverage is empty, generate topics now (once per interview)
+    // ── 3. First-turn bootstrap & Phase Management ───────────────────────────
     if (state.coverage.length === 0) {
       const seed = state.conversationSeed ?? 0;
       state.coverage = await generateCoverageTopics(interview.jobRole, resume, seed);
       console.log(`[TURN] Generated ${state.coverage.length} coverage topics (seed=${seed}) for ${interviewId}`);
     }
 
-    // Phase: intro → warmup on first candidate utterance (unconditional)
-    if (state.phase === "intro") {
-      state.phase = "warmup";
-      state.startedAt = Date.now();
+    let currentState = structuredClone(state);
+
+    // Initial phase transition: intro -> warmup
+    if (currentState.phase === "intro") {
+      currentState = advancePhase(currentState);
       if (resume) {
-        state.firstName = resume.fullName.split(" ")[0];
+        currentState.firstName = resume.fullName.split(" ")[0];
       }
     }
 
+    const utterance = body.userUtterance.trim();
+
+    // Warmup turn increment & transition check
+    if (currentState.phase === "warmup") {
+      currentState.warmupTurns = (currentState.warmupTurns || 0) + 1;
+      const askedToStart = /\b(start|begin|ready|shall we start|can we start)\b/i.test(utterance);
+      currentState = advancePhase(currentState, { candidateAskedToStart: askedToStart });
+    }
+
     // ── 4. Hard caps ─────────────────────────────────────────────────────────
-    const elapsedMs = state.startedAt ? Date.now() - state.startedAt : 0;
-    const remainingTurns = BRAIN_CONFIG.maxTotalTurns - state.turnCount;
+    const elapsedMs = currentState.startedAt ? Date.now() - currentState.startedAt : 0;
+    const remainingTurns = BRAIN_CONFIG.maxTotalTurns - currentState.turnCount;
     const remainingMs = BRAIN_CONFIG.timeBudgetMs - elapsedMs;
     const remainingMinutes = Math.max(0, Math.round(remainingMs / 60000));
 
     if (remainingTurns <= 0 || remainingMs <= 0) {
-      // Hard kill: force wrapup
       const say = "We're coming up on time — do you have any questions for me before we close?";
-      const nextState: ConversationState = { ...state, phase: "wrapup", turnCount: state.turnCount + 1 };
+      const nextState: ConversationState = { ...currentState, phase: "wrapup", turnCount: currentState.turnCount + 1 };
       after(() => saveState(interviewId, nextState, { currentPhase: "wrapup" }));
       return NextResponse.json({ say, phase: "wrapup", isComplete: false });
     }
 
     // ── 5. Pre-check: garble / empty string ───────────────────────────────────
-    const utterance = body.userUtterance.trim();
     if (utterance.length < 2) {
-      const say = state.clarifyCount >= 2
+      const say = currentState.clarifyCount >= 2
         ? BRAIN_CONFIG.clarifyLadder[2]
-        : BRAIN_CONFIG.clarifyLadder[state.clarifyCount % BRAIN_CONFIG.clarifyLadder.length];
-      const nextState = { ...state, clarifyCount: (state.clarifyCount || 0) + 1 };
+        : BRAIN_CONFIG.clarifyLadder[currentState.clarifyCount % BRAIN_CONFIG.clarifyLadder.length];
+      const nextState = { ...currentState, clarifyCount: (currentState.clarifyCount || 0) + 1 };
       after(() => saveState(interviewId, nextState));
-      return NextResponse.json({ say, phase: state.phase, isComplete: false });
+      return NextResponse.json({ say, phase: currentState.phase, isComplete: false });
     }
 
-    let currentState = structuredClone(state);
-
-    // ── 6. Activate first topic if nothing is active yet ─────────────────────
-    const hasActiveTopic = currentState.coverage.some((t) => t.status === "active");
-    if (!hasActiveTopic && currentState.phase === "warmup") {
-      // warmup: no topic active yet — let LLM phrase the warmup question
-    } else if (!hasActiveTopic && currentState.phase === "core") {
-      const res = activateNextTopic(currentState);
-      currentState = res.nextState;
-    } else if (!hasActiveTopic && currentState.phase !== "wrapup" && currentState.phase !== "closing") {
-      // warmup complete → enter core
-      if (currentState.turnCount >= BRAIN_CONFIG.maxWarmupTurns) {
-        currentState.phase = "core";
+    // ── 6. Ensure active topic in core phase ──────────────────────────────────
+    if (currentState.phase === "core") {
+      const hasActiveTopic = currentState.coverage.some((t) => t.status === "active");
+      if (!hasActiveTopic) {
         const res = activateNextTopic(currentState);
         currentState = res.nextState;
       }
@@ -201,10 +198,8 @@ export async function POST(
       console.log(`[TURN] Signals: tech=[${signals.technologies.join(",")}] claims=${signals.claims.length} threads=${signals.openThreads.length}`);
     }
 
-    // ── 8. LLM call (evaluate + decide + speak) ───────────────────────────────
-    // Compute adaptive depth BEFORE the LLM call so it's injected into context
+    // ── 8. LLM call setup ─────────────────────────────────────────────────────
     const activeTopic = currentState.coverage.find((t) => t.status === "active");
-    const recentScores = currentState.scores.map((s) => s.score);
     const turnsOnTopic = activeTopic?.followUps ?? 0;
     const targetDepth = computeTargetDepth(
       currentState.kScore ?? 5,
@@ -213,13 +208,14 @@ export async function POST(
     );
     const avgAnswerWords = computeAvgAnswerLength(body.recentTranscript);
 
-    // Get KB entry for the active topic to pass depth ladder guidance
     const kbEntry = activeTopic ? getKBEntry(activeTopic.id) : undefined;
     const depthGuidance = kbEntry ? kbEntry.depthLadder[targetDepth] : undefined;
 
-    // Get opening template for warmup first turn
-    const isFirstWarmupTurn = currentState.phase === "warmup" && currentState.turnCount === 0;
-    const openingTemplate = isFirstWarmupTurn
+    // Check if this is the bridge turn (first core question)
+    const nonWarmupAsked = currentState.asked.filter((q) => q.topic !== "warmup" && q.topic !== "intro");
+    const isFirstCoreQuestion = currentState.phase === "core" && nonWarmupAsked.length === 0;
+
+    const openingTemplate = isFirstCoreQuestion
       ? getOpeningTemplate(currentState.conversationSeed ?? 0)
       : undefined;
 
@@ -238,6 +234,7 @@ export async function POST(
       depthGuidance,
       avgAnswerWords,
       openingTemplate,
+      isBridgeTurn: isFirstCoreQuestion,
     });
 
     let llmResponse = null;
@@ -275,7 +272,7 @@ export async function POST(
       console.error("[TURN] All LLM providers failed:", llmErr?.message);
     }
 
-    // ── 8. Enforce decision policy ────────────────────────────────────────────
+    // ── 9. Enforce decision policy ────────────────────────────────────────────
     let finalSay: string;
     let finalAction: string;
     let finalIntent = llmResponse?.intent ?? "garbled";
@@ -292,7 +289,7 @@ export async function POST(
       shouldEndInterview = enforced.shouldEndInterview;
       if (enforced.updatedState) currentState = enforced.updatedState;
 
-      // ── 9. Duplicate question & Phrase repeat guard ──────────────────────
+      // Duplicate question & Phrase repeat guard
       const isTooSimilarQuestion = (
         finalAction !== "clarify" &&
         finalAction !== "smalltalk_redirect" &&
@@ -305,16 +302,15 @@ export async function POST(
       const isPhraseRep = isPhraseRepeated(finalSay, currentState.spokenReplies);
 
       if (isTooSimilarQuestion || isPhraseRep) {
-        console.warn("[TURN] Repeat guard triggered (similar question or phrase match), forcing alternative fallback phrasing");
-        finalSay = getFallbackUtterance(currentState);
+        console.warn("[TURN] Repeat guard triggered, forcing alternative fallback phrasing with bridge");
+        const fallback = getFallbackUtterance(currentState);
+        finalSay = `Got it. Moving on to our next area — ${fallback}`;
         if (isTooSimilarQuestion) {
           shouldAdvanceTopic = true;
           finalAction = "next_topic";
         }
       }
     } else {
-      // All providers failed — use deterministic fallback (never greeting, never repeat)
-      // Use seed-based fallback for variety across interviews
       finalSay = getSeedFallbackUtterance(currentState);
       finalAction = "fallback";
       console.warn("[TURN] Using deterministic fallback utterance");
@@ -323,15 +319,12 @@ export async function POST(
     // ── 10. State updates ─────────────────────────────────────────────────────
     const newState: ConversationState = structuredClone(currentState);
 
-    // Record spoken reply in last-8 history
     newState.spokenReplies = [...(newState.spokenReplies || []), finalSay].slice(-BRAIN_CONFIG.historyRepeatWindow);
 
-    // Update facts memory
     if (llmResponse?.evaluation?.facts?.length) {
       newState.facts = Array.from(new Set([...newState.facts, ...llmResponse.evaluation.facts]));
     }
 
-    // Record asked question (for repeat guard)
     const currentActiveTopic = newState.coverage.find((t) => t.status === "active");
     if (
       finalSay &&
@@ -347,11 +340,12 @@ export async function POST(
       newState.asked = [...newState.asked, askedEntry];
     }
 
-    // Record score ONLY for intent "answer" or "partial" (never for meta, smalltalk, clarify, etc.)
+    // Warmup turns are NEVER scored! Score recorded ONLY in core phase for scorable intent
     const isScorableIntent = finalIntent === "answer" || finalIntent === "partial";
     const hasScoreValue = llmResponse?.evaluation?.score !== null && llmResponse?.evaluation?.score !== undefined;
+    const isCorePhase = newState.phase === "core";
 
-    if (isScorableIntent && hasScoreValue && activeTopic && finalAction !== "clarify" && finalAction !== "nudge") {
+    if (isCorePhase && isScorableIntent && hasScoreValue && activeTopic && finalAction !== "clarify" && finalAction !== "nudge") {
       const score: TurnScore = {
         turnIndex: newState.turnCount,
         topic: activeTopic.id,
@@ -362,7 +356,6 @@ export async function POST(
       };
       newState.scores = [...newState.scores, score];
 
-      // ── Phase 2: Update K-Score ────────────────────────────────────────────
       const prevScoreValues = newState.scores.slice(0, -1).map((s) => s.score);
       const { kScore, kScoreTrend } = updateKScore(
         newState.kScore ?? 5,
@@ -372,15 +365,9 @@ export async function POST(
       newState.kScore = kScore;
       newState.kScoreTrend = kScoreTrend;
       newState.targetDepth = computeTargetDepth(kScore, kScoreTrend, turnsOnTopic);
-
-      console.log(
-        `[TURN] kScore=${kScore.toFixed(2)} trend=${kScoreTrend} targetDepth=${newState.targetDepth} ` +
-        `turnScore=${score.score} topic=${activeTopic.id}`,
-      );
     }
 
-    // Update follow-up counter
-    if (finalAction === "followup") {
+    if (finalAction === "followup" && isCorePhase) {
       newState.followUpsOnCurrent = newState.followUpsOnCurrent + 1;
       if (activeTopic) {
         const idx = newState.coverage.findIndex((t) => t.id === activeTopic.id);
@@ -388,32 +375,33 @@ export async function POST(
       }
     }
 
-    // ── Thread tracking (answer-grounded follow-up) ───────────────────────────
-    // When following up on an answer, update the active thread from signals.
-    // When advancing topic, clear the thread so the new topic starts fresh.
-    const isAnswerIntent = finalIntent === "answer" || finalIntent === "partial";
-    if (finalAction === "followup" && isAnswerIntent) {
-      // Build a thread label from the strongest signal
-      const topTech = signals.technologies[0];
-      const topClaim = signals.claims[0];
-      const newThread = topTech
-        ? `${topTech}${topClaim ? ` — ${topClaim.slice(0, 60)}` : ""}`
-        : topClaim
-          ? topClaim.slice(0, 80)
-          : newState.activeThread; // keep existing thread if no new signals
-      if (newThread) {
-        newState.activeThread = newThread;
+    // ── Thread tracking & openThread preferred storage ───────────────────────
+    if (finalAction === "followup" && isScorableIntent && isCorePhase) {
+      const openThread = llmResponse?.evaluation?.openThread;
+      if (openThread && typeof openThread === "string" && openThread.trim().length > 3) {
+        newState.activeThread = openThread.trim();
         newState.threadDepth = (newState.threadDepth ?? 0) + 1;
+      } else {
+        const topTech = signals.technologies[0];
+        const topClaim = signals.claims[0];
+        const newThread = topTech
+          ? `${topTech}${topClaim ? ` — ${topClaim.slice(0, 60)}` : ""}`
+          : topClaim
+            ? topClaim.slice(0, 80)
+            : newState.activeThread;
+        if (newThread) {
+          newState.activeThread = newThread;
+          newState.threadDepth = (newState.threadDepth ?? 0) + 1;
+        }
       }
     } else if (finalAction === "next_topic" || shouldAdvanceTopic) {
-      // Moving to a new topic — reset thread
       newState.activeThread = undefined;
       newState.threadDepth = 0;
     }
 
-    // Advance topic (pure function)
+    // Topic advancement
     let stateAfterTopic = newState;
-    if (shouldAdvanceTopic && activeTopic) {
+    if (shouldAdvanceTopic && activeTopic && isCorePhase) {
       const stateClosed = closeActiveTopic(
         stateAfterTopic,
         llmResponse?.evaluation.score ?? 5,
@@ -426,14 +414,8 @@ export async function POST(
       }
     }
 
-    // Phase transitions: warmup → core when warmup turns exhausted
-    if (stateAfterTopic.phase === "warmup" && stateAfterTopic.turnCount + 1 >= BRAIN_CONFIG.maxWarmupTurns) {
-      stateAfterTopic.phase = "core";
-      if (!stateAfterTopic.coverage.some((t) => t.status === "active")) {
-        const res = activateNextTopic(stateAfterTopic);
-        stateAfterTopic = res.nextState;
-      }
-    }
+    // Re-evaluate phase transitions (warmup -> core) with advancePhase
+    stateAfterTopic = advancePhase(stateAfterTopic, { lastIntent: finalIntent });
 
     if (finalAction === "wrapup") stateAfterTopic.phase = "wrapup";
     if (finalAction === "end") stateAfterTopic.phase = "closing";
@@ -445,7 +427,7 @@ export async function POST(
 
     const totalLatencyMs = Date.now() - routeStart;
     console.log(
-      `[TURN] interview=${interviewId} phase=${stateAfterTopic.phase} intent=${finalIntent} action=${finalAction} ` +
+      `[TURN] interview=${interviewId} phase=${stateAfterTopic.phase} warmupTurns=${stateAfterTopic.warmupTurns} intent=${finalIntent} action=${finalAction} ` +
       `provider=${provider} llm_ms=${llmLatencyMs} total_ms=${totalLatencyMs}`,
     );
 
@@ -468,11 +450,36 @@ export async function POST(
         : {}),
     };
 
-    // Store idempotency key & response payload in state
     stateAfterTopic.lastRequestId = requestId;
     stateAfterTopic.lastResponse = responsePayload;
 
-    // ── 11. Persist state (non-blocking) ─────────────────────────────────────
+    logEvent(req, {
+      userId,
+      sessionId,
+      interviewId,
+      type: "turn",
+      meta: {
+        model: llmResponse ? (provider === "gemini" ? "gemini-3.8-flash" : "groq") : "none",
+        provider,
+        latencyMs: totalLatencyMs,
+        intent: finalIntent,
+        score: evalSnapshot?.score ?? null,
+        kScore: stateAfterTopic.kScore ?? null,
+        depth: stateAfterTopic.targetDepth ?? 0,
+        action: finalAction,
+      },
+    });
+
+    if (isComplete) {
+      logEvent(req, {
+        userId,
+        sessionId,
+        interviewId,
+        type: "complete",
+      });
+    }
+
+    // ── 11. Persist state ────────────────────────────────────────────────────
     after(async () => {
       try {
         await saveState(interviewId, stateAfterTopic, {
@@ -480,7 +487,6 @@ export async function POST(
           ...(isComplete ? { status: "completed" } : {}),
         });
 
-        // Update DB counters
         await db
           .update(interviews)
           .set({
@@ -510,9 +516,6 @@ export async function POST(
   }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/** Map new 5-phase enum to the existing DB phaseEnum (4-phase + closed) */
 function mapPhaseToEnum(phase: ConversationState["phase"]): string {
   const map: Record<ConversationState["phase"], string> = {
     intro: "greeting",

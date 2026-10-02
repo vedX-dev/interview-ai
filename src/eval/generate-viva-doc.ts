@@ -193,7 +193,7 @@ export function generateVivaDoc(): void {
   const nowStr = new Date().toISOString();
   let doc = `# Viva AI Performance Evaluation and Quantitative Measurement Report
 
-*System: InterviewAI Autonomous Technical Interviewer*  
+*System: Intervia Autonomous Technical Interviewer*  
 *Generated on: ${nowStr}*  
 *Data Sources: \`eval-data/turns_*.csv\`, \`eval-data/questions_*.csv\`, \`eval-data/latency_events.jsonl\`*
 
@@ -213,7 +213,7 @@ export function generateVivaDoc(): void {
 ## 1. Overview & Study Scope
 
 ### Overview & Purpose
-This document presents the empirical quantitative evaluation results for **InterviewAI**, executing the measurement methodology specified in the *Viva AI Performance Evaluation and Quantitative Measurement Guide*. All metrics reported herein are computed directly from real recorded session data and verified human evaluations.
+This document presents the empirical quantitative evaluation results for **Intervia**, executing the measurement methodology specified in the *Viva AI Performance Evaluation and Quantitative Measurement Guide*. All metrics reported herein are computed directly from real recorded session data and verified human evaluations.
 
 ### Study Scope (Empirical Data Summary)
 - **Distinct Interview Sessions Analyzed:** \`${distinctInterviews}\`

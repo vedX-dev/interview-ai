@@ -25,6 +25,9 @@ if (typeof window === "undefined") {
     GEMINI_API_KEY: "Gemini LLM + embeddings",
     GROQ_API_KEY: "Groq LLM (fast fallback)",
     SARVAM_API_KEY: "Sarvam TTS",
+    LOG_SALT: "Audit log IP hashing salt (fallback salt will be used)",
+    ADMIN_USER_IDS: "Admin dashboard access (Clerk user IDs)",
+    ADMIN_ALLOWED_IPS: "Admin dashboard IP allowlist (network restriction)",
   };
 
   for (const [key, desc] of Object.entries(optional)) {

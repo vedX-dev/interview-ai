@@ -367,7 +367,7 @@ async function runPhase6Tests() {
 
 async function main() {
   console.log("╔════════════════════════════════════════════════════════════════════════════════╗");
-  console.log("║     INTERVIEWAI — FULL SYSTEM VERIFICATION HARNESS (PHASES 1 - 6)            ║");
+  console.log("║     INTERVIA — FULL SYSTEM VERIFICATION HARNESS (PHASES 1 - 6)                ║");
   console.log("╚════════════════════════════════════════════════════════════════════════════════╝");
 
   try {
