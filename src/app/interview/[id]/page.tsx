@@ -7,6 +7,7 @@ import { IntegrityDetector } from "@/src/lib/integrity/detector";
 import { INTEGRITY_CONFIG } from "@/src/lib/integrity/config";
 import type { IntegrityEvent } from "@/src/schemas/integrity";
 import { MOCK_STRUCTURED_RESUME } from "@/src/lib/default-interview-plan";
+import LatticeLoader from "@/src/components/ui/LatticeLoader";
 
 type TurnState = "idle" | "ai_speaking" | "user_turn" | "processing";
 
@@ -118,20 +119,20 @@ export default function InterviewRoomPage() {
   const [isGeneratingFeedback, setIsGeneratingFeedback] = useState(false);
   const [feedback, setFeedback] = useState<any>(null);
   const [showFeedback, setShowFeedback] = useState(false);
-  
+
   // Speech recognition state
   const [supportsSpeechRecognition, setSupportsSpeechRecognition] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState("");
   const [useFallbackInput, setUseFallbackInput] = useState(false);
-  
+
   // Interview brain state (server-owned: phase, turns)
   const [isAiThinking, setIsAiThinking] = useState(false);
   const [aiProvider, setAiProvider] = useState<string>("gemini");
   const [ttsProvider, setTtsProvider] = useState<"browser" | "sarvam">("sarvam");
   const [currentPhase, setCurrentPhase] = useState<string>("intro");
   const [candidateProfile, setCandidateProfile] = useState<any>(null);
-  
+
   const recognitionRef = useRef<any>(null);
   const synthesisRef = useRef<SpeechSynthesis | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -208,8 +209,8 @@ export default function InterviewRoomPage() {
         acquiredStream.getTracks().forEach((t) => t.stop());
       }
     };
-  // Only run once on mount — not when isCameraOn toggles
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // Only run once on mount — not when isCameraOn toggles
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ── Camera: attach srcObject AFTER the video element mounts ─────────────────
@@ -346,7 +347,7 @@ export default function InterviewRoomPage() {
         if (calStr) {
           try {
             detector.setBaseline(JSON.parse(calStr));
-          } catch (e) {}
+          } catch (e) { }
         }
         detector.start(videoRef.current);
         integrityDetectorRef.current = detector;
@@ -394,8 +395,8 @@ export default function InterviewRoomPage() {
   // Keyboard shortcut for mic (M key) — uses refs to avoid hoisting issue
   const isListeningRef = useRef(false);
   const turnStateRef = useRef<TurnState>("idle");
-  const startListeningRef = useRef<() => void>(() => {});
-  const stopListeningRef = useRef<() => void>(() => {});
+  const startListeningRef = useRef<() => void>(() => { });
+  const stopListeningRef = useRef<() => void>(() => { });
 
   useEffect(() => {
     isListeningRef.current = isListening;
@@ -439,7 +440,7 @@ export default function InterviewRoomPage() {
         stage,
         ts,
       }),
-    }).catch(() => {});
+    }).catch(() => { });
   }, [interviewId, transcript.length]);
 
   // Stop all active AI speech immediately (Barge-in / Interruption)
@@ -448,13 +449,13 @@ export default function InterviewRoomPage() {
       try {
         activeAudioRef.current.pause();
         activeAudioRef.current.currentTime = 0;
-      } catch (e) {}
+      } catch (e) { }
       activeAudioRef.current = null;
     }
     if (typeof window !== "undefined" && "speechSynthesis" in window) {
       try {
         window.speechSynthesis.cancel();
-      } catch (e) {}
+      } catch (e) { }
     }
   }, []);
 
@@ -520,12 +521,21 @@ export default function InterviewRoomPage() {
       }
 
       setTurnState("ai_speaking");
-      await appendTranscript(questionText, "ai");
-      
+      let textAppended = false;
+
+      const triggerTextDisplay = async () => {
+        if (!textAppended) {
+          textAppended = true;
+          setIsAiThinking(false);
+          await appendTranscript(questionText, "ai");
+        }
+      };
+
       // Try Sarvam TTS first if enabled
       if (ttsProvider === "sarvam") {
         try {
-          await speakWithSarvam(questionText);
+          await speakWithSarvam(questionText, triggerTextDisplay);
+          await triggerTextDisplay();
           setTurnState("user_turn");
           return;
         } catch (error) {
@@ -535,13 +545,14 @@ export default function InterviewRoomPage() {
       }
 
       // Fallback to browser TTS
-      await speakWithBrowserTTS(questionText);
+      await speakWithBrowserTTS(questionText, triggerTextDisplay);
+      await triggerTextDisplay();
       setTurnState("user_turn");
     },
     [ttsProvider, appendTranscript],
   );
 
-  const speakWithSarvam = async (text: string) => {
+  const speakWithSarvam = async (text: string, onAudioStart?: () => void) => {
     const response = await fetch("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -558,6 +569,7 @@ export default function InterviewRoomPage() {
     }
 
     // Sequentially play audio chunks with barge-in support
+    let chunkIdx = 0;
     for (const audioBase64 of data.audios) {
       const audioBytes = Uint8Array.from(atob(audioBase64), (c) => c.charCodeAt(0));
       const audioBlob = new Blob([audioBytes], { type: "audio/wav" });
@@ -583,25 +595,27 @@ export default function InterviewRoomPage() {
         };
         audio.oncanplaythrough = () => {
           if (activeAudioRef.current === audio) {
+            if (chunkIdx === 0 && onAudioStart) {
+              onAudioStart();
+            }
             sendClientLatencyLog("audio_playback_start");
             audio.play().catch(reject);
           }
         };
       });
+      chunkIdx++;
     }
   };
 
-  const speakWithBrowserTTS = async (text: string) => {
+  const speakWithBrowserTTS = async (text: string, onAudioStart?: () => void) => {
     // Use real TTS if available
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.rate = 1;
-      utterance.pitch = 0.9; // Slightly lower pitch for male voice
-      
-      // Get voices - handle async loading in some browsers
+      utterance.pitch = 0.9;
+
       let voices = window.speechSynthesis.getVoices();
       if (voices.length === 0) {
-        // Voices might not be loaded yet, wait for them
         await new Promise<void>((resolve) => {
           const loadVoices = () => {
             voices = window.speechSynthesis.getVoices();
@@ -611,29 +625,30 @@ export default function InterviewRoomPage() {
             }
           };
           window.speechSynthesis.addEventListener('voiceschanged', loadVoices);
-          // Fallback timeout
           setTimeout(() => {
             window.speechSynthesis.removeEventListener('voiceschanged', loadVoices);
             resolve();
           }, 1000);
         });
       }
-      
-      // Try to find a male English voice
-      const maleVoice = voices.find(voice => 
-        voice.lang.startsWith('en') && 
-        (voice.name.toLowerCase().includes('male') || 
-         voice.name.toLowerCase().includes('david') ||
-         voice.name.toLowerCase().includes('mark') ||
-         voice.name.toLowerCase().includes('james') ||
-         voice.name.toLowerCase().includes('daniel'))
+
+      const maleVoice = voices.find(voice =>
+        voice.lang.startsWith('en') &&
+        (voice.name.toLowerCase().includes('male') ||
+          voice.name.toLowerCase().includes('david') ||
+          voice.name.toLowerCase().includes('mark') ||
+          voice.name.toLowerCase().includes('james') ||
+          voice.name.toLowerCase().includes('daniel'))
       ) || voices.find(voice => voice.lang.startsWith('en'));
-      
+
       if (maleVoice) {
         utterance.voice = maleVoice;
       }
-      
+
       await new Promise<void>((resolve, reject) => {
+        utterance.onstart = () => {
+          if (onAudioStart) onAudioStart();
+        };
         utterance.onend = () => resolve();
         utterance.onerror = (e) => reject(new Error("Browser TTS failed"));
         window.speechSynthesis.speak(utterance);
@@ -662,7 +677,7 @@ export default function InterviewRoomPage() {
     setIsAiThinking(true);
 
     // Safe requestId: interviewId + transcript length + short djb2 hash (no raw utterance in logs)
-    const h = userUtterance.split('').reduce((acc, c) => (Math.imul(31, acc) + c.charCodeAt(0)) | 0, 0).toString(36).replace('-','').slice(-6);
+    const h = userUtterance.split('').reduce((acc, c) => (Math.imul(31, acc) + c.charCodeAt(0)) | 0, 0).toString(36).replace('-', '').slice(-6);
     const clientRequestId = customRequestId || `${interviewId}_t${updatedTranscript.length}_${h}`;
 
     // Build last-6-turns for context (explicit, not from stale state)
@@ -740,7 +755,7 @@ export default function InterviewRoomPage() {
     if (typeof window !== 'undefined') {
       const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
       setSupportsSpeechRecognition(!!SpeechRecognition);
-      
+
       // Load voices for TTS
       if ('speechSynthesis' in window) {
         window.speechSynthesis.getVoices();
@@ -777,9 +792,9 @@ export default function InterviewRoomPage() {
         const response = await fetch(
           `/api/interviews/transcript?interviewId=${interviewId}`,
         );
-        
+
         console.log("[LOAD SESSION] Response status:", response.status);
-        
+
         if (response.status === 404) {
           throw new Error("Interview not found. Please start a new interview from the home page.");
         }
@@ -851,7 +866,7 @@ export default function InterviewRoomPage() {
         if (!cancelled) {
           console.error("[LOAD SESSION] Error:", error);
           setTranscriptError(
-            error instanceof Error 
+            error instanceof Error
               ? `Failed to load interview session: ${error.message}. Please refresh the page or try starting a new interview.`
               : "Failed to load interview session. Please refresh the page or try starting a new interview.",
           );
@@ -880,27 +895,27 @@ export default function InterviewRoomPage() {
 
   const startListening = () => {
     if (!supportsSpeechRecognition || isListening) return;
-    
+
     // Barge-in: Stop active AI speech when user starts listening/speaking
     stopAiSpeech();
-    
+
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SpeechRecognition) return;
-    
+
     const recognition = new SpeechRecognition();
     recognition.continuous = false;
     recognition.interimResults = true;
     recognition.lang = 'en-US';
-    
+
     recognition.onstart = () => {
       setIsListening(true);
       setInterimTranscript("");
     };
-    
+
     recognition.onresult = (event: SpeechRecognitionEvent) => {
       const { resultIndex, results } = event;
       const currentResult = results[resultIndex];
-      
+
       if (currentResult.isFinal) {
         const finalText = currentResult[0].transcript;
         setUserInput(finalText);
@@ -911,12 +926,12 @@ export default function InterviewRoomPage() {
         setInterimTranscript(currentResult[0].transcript);
       }
     };
-    
+
     recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
       console.error('Speech recognition error:', event.error);
       setIsListening(false);
       setInterimTranscript("");
-      
+
       switch (event.error) {
         case 'not-allowed':
           setTranscriptError('Microphone permission denied. Using text input fallback.');
@@ -941,15 +956,15 @@ export default function InterviewRoomPage() {
           setUseFallbackInput(true);
       }
     };
-    
+
     recognition.onend = () => {
       setIsListening(false);
     };
-    
+
     recognitionRef.current = recognition;
     recognition.start();
   };
-  
+
   const stopListening = () => {
     if (recognitionRef.current) {
       recognitionRef.current.stop();
@@ -1011,7 +1026,7 @@ export default function InterviewRoomPage() {
     if (integrityDetectorRef.current) {
       try {
         integrityDetectorRef.current.stop();
-      } catch (e) {}
+      } catch (e) { }
     }
 
     // 4. Immediately stop camera stream and release media tracks
@@ -1033,7 +1048,7 @@ export default function InterviewRoomPage() {
       fetch(`/api/interviews/${interviewId}/feedback/generate`, {
         method: "POST",
       }).catch((e) => console.warn("[END_SESSION] Feedback trigger error (non-critical):", e));
-    } catch {}
+    } catch { }
 
     // 7. Route to feedback report page (which displays full report and handles polling/fallbacks)
     router.push(`/interview/${interviewId}/feedback`);
@@ -1150,11 +1165,10 @@ export default function InterviewRoomPage() {
           {/* Unobtrusive Integrity Indicator */}
           <span
             onClick={() => setShowDevOverlay((prev) => !prev)}
-            className={`cursor-pointer inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold border transition-colors ${
-              integrityStrikes > 0
+            className={`cursor-pointer inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold border transition-colors ${integrityStrikes > 0
                 ? "bg-amber-950/40 border-amber-500/50 text-amber-300"
                 : "bg-emerald-950/30 border-emerald-500/30 text-emerald-400"
-            }`}
+              }`}
             title="Click to toggle dev-only vision overlay"
           >
             <span className={`h-2 w-2 rounded-full ${integrityStrikes > 0 ? "bg-amber-400 animate-ping" : "bg-emerald-400 animate-pulse"}`} />
@@ -1165,34 +1179,32 @@ export default function InterviewRoomPage() {
             {aiProvider}
           </span>
           <span
-            className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold border ${
-              isAiThinking
+            className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold border ${isAiThinking
                 ? "bg-amber-950/40 border-amber-500/50 text-amber-300 animate-pulse"
                 : isAiSpeaking
-                ? "bg-purple-950/40 border-purple-500/50 text-purple-300"
-                : turnState === "user_turn"
-                ? "bg-emerald-950/40 border-emerald-500/50 text-emerald-300"
-                : "bg-zinc-900 border-zinc-800 text-zinc-400"
-            }`}
+                  ? "bg-purple-950/40 border-purple-500/50 text-purple-300"
+                  : turnState === "user_turn"
+                    ? "bg-emerald-950/40 border-emerald-500/50 text-emerald-300"
+                    : "bg-zinc-900 border-zinc-800 text-zinc-400"
+              }`}
           >
             <span
-              className={`h-2 w-2 rounded-full ${
-                isAiThinking
+              className={`h-2 w-2 rounded-full ${isAiThinking
                   ? "bg-amber-400 animate-ping"
                   : isAiSpeaking
-                  ? "bg-purple-400 animate-ping"
-                  : turnState === "user_turn"
-                  ? "bg-emerald-400 animate-pulse"
-                  : "bg-zinc-500"
-              }`}
+                    ? "bg-purple-400 animate-ping"
+                    : turnState === "user_turn"
+                      ? "bg-emerald-400 animate-pulse"
+                      : "bg-zinc-500"
+                }`}
             />
             {isAiThinking
               ? "AI Thinking"
               : isAiSpeaking
-              ? "AI Speaking"
-              : turnState === "user_turn"
-              ? "Listening"
-              : "Idle"}
+                ? "AI Speaking"
+                : turnState === "user_turn"
+                  ? "Listening"
+                  : "Idle"}
           </span>
         </div>
       </header>
@@ -1256,23 +1268,21 @@ export default function InterviewRoomPage() {
         <div className="flex-1 min-h-0 grid grid-cols-1 sm:grid-cols-2 gap-3">
           {/* AI Interviewer Tile */}
           <div
-            className={`relative min-h-0 rounded-2xl bg-zinc-900/90 border border-zinc-800/90 overflow-hidden flex flex-col items-center justify-center p-4 transition-all duration-300 ${
-              isAiSpeaking
+            className={`relative min-h-0 rounded-2xl bg-zinc-900/90 border border-zinc-800/90 overflow-hidden flex flex-col items-center justify-center p-4 transition-all duration-300 ${isAiSpeaking
                 ? "ring-2 ring-purple-500/80 shadow-[0_0_25px_rgba(168,85,247,0.3)]"
                 : isAiThinking
-                ? "ring-2 ring-amber-500/50"
-                : ""
-            }`}
+                  ? "ring-2 ring-amber-500/50"
+                  : ""
+              }`}
           >
             <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,_rgba(139,92,246,0.15)_0%,_transparent_70%)]" />
 
             <div className="relative flex flex-col items-center gap-4 z-10">
               <div
-                className={`relative flex h-28 w-28 sm:h-36 sm:w-36 items-center justify-center rounded-full border-2 bg-purple-950/70 transition-all ${
-                  isAiSpeaking
+                className={`relative flex h-28 w-28 sm:h-36 sm:w-36 items-center justify-center rounded-full border-2 bg-purple-950/70 transition-all ${isAiSpeaking
                     ? "border-purple-300/80 shadow-[0_0_40px_rgba(168,85,247,0.4)] scale-105"
                     : "border-purple-500/40"
-                }`}
+                  }`}
               >
                 {isAiSpeaking && (
                   <>
@@ -1295,24 +1305,23 @@ export default function InterviewRoomPage() {
                 {Array.from({ length: 12 }).map((_, i) => (
                   <span
                     key={i}
-                    className={`w-1 rounded-full transition-all ${
-                      isAiSpeaking
+                    className={`w-1 rounded-full transition-all ${isAiSpeaking
                         ? "bg-purple-300"
                         : isAiThinking
-                        ? "bg-amber-400/60"
-                        : "bg-purple-900/40"
-                    }`}
+                          ? "bg-amber-400/60"
+                          : "bg-purple-900/40"
+                      }`}
                     style={{
                       height: isAiSpeaking
                         ? `${10 + (i % 6) * 4}px`
                         : isAiThinking
-                        ? `${6 + (i % 4) * 3}px`
-                        : "6px",
+                          ? `${6 + (i % 4) * 3}px`
+                          : "6px",
                       animation: isAiSpeaking
                         ? `speechBar ${0.4 + (i % 4) * 0.15}s ease-in-out infinite alternate`
                         : isAiThinking
-                        ? `speechBar 0.8s ease-in-out infinite alternate`
-                        : undefined,
+                          ? `speechBar 0.8s ease-in-out infinite alternate`
+                          : undefined,
                     }}
                   />
                 ))}
@@ -1328,11 +1337,10 @@ export default function InterviewRoomPage() {
 
           {/* Candidate Tile */}
           <div
-            className={`relative min-h-0 rounded-2xl bg-zinc-900/90 border border-zinc-800/90 overflow-hidden flex flex-col items-center justify-center p-4 transition-all duration-300 ${
-              turnState === "user_turn" && isListening
+            className={`relative min-h-0 rounded-2xl bg-zinc-900/90 border border-zinc-800/90 overflow-hidden flex flex-col items-center justify-center p-4 transition-all duration-300 ${turnState === "user_turn" && isListening
                 ? "ring-2 ring-emerald-500/80 shadow-[0_0_25px_rgba(16,185,129,0.3)]"
                 : ""
-            }`}
+              }`}
           >
             {/* Always-mounted video element — visibility toggled to avoid srcObject race */}
             <video
@@ -1340,9 +1348,8 @@ export default function InterviewRoomPage() {
               autoPlay
               playsInline
               muted
-              className={`absolute inset-0 h-full w-full object-cover transform -scale-x-100 rounded-2xl z-0 transition-opacity duration-300 ${
-                isCameraOn && mediaStream ? "opacity-100" : "opacity-0 pointer-events-none"
-              }`}
+              className={`absolute inset-0 h-full w-full object-cover transform -scale-x-100 rounded-2xl z-0 transition-opacity duration-300 ${isCameraOn && mediaStream ? "opacity-100" : "opacity-0 pointer-events-none"
+                }`}
             />
 
             {/* Gradient overlay when webcam is active */}
@@ -1359,11 +1366,10 @@ export default function InterviewRoomPage() {
             {(!isCameraOn || !mediaStream) && (
               <div className="relative flex flex-col items-center gap-4 z-10">
                 <div
-                  className={`relative flex h-28 w-28 sm:h-36 sm:w-36 items-center justify-center rounded-full border-2 bg-emerald-950/70 transition-all ${
-                    turnState === "user_turn" && isListening
+                  className={`relative flex h-28 w-28 sm:h-36 sm:w-36 items-center justify-center rounded-full border-2 bg-emerald-950/70 transition-all ${turnState === "user_turn" && isListening
                       ? "border-emerald-300/80 shadow-[0_0_40px_rgba(16,185,129,0.4)] scale-105"
                       : "border-emerald-500/40"
-                  }`}
+                    }`}
                 >
                   {turnState === "user_turn" && isListening && (
                     <>
@@ -1386,9 +1392,8 @@ export default function InterviewRoomPage() {
                   {Array.from({ length: 12 }).map((_, i) => (
                     <span
                       key={i}
-                      className={`w-1 rounded-full transition-all ${
-                        isListening ? "bg-emerald-300" : "bg-emerald-900/40"
-                      }`}
+                      className={`w-1 rounded-full transition-all ${isListening ? "bg-emerald-300" : "bg-emerald-900/40"
+                        }`}
                       style={{
                         height: isListening ? `${10 + (i % 6) * 4}px` : "6px",
                         animation: isListening
@@ -1407,9 +1412,8 @@ export default function InterviewRoomPage() {
                 {Array.from({ length: 8 }).map((_, i) => (
                   <span
                     key={i}
-                    className={`w-1 rounded-full transition-all ${
-                      isListening ? "bg-emerald-400" : "bg-zinc-600"
-                    }`}
+                    className={`w-1 rounded-full transition-all ${isListening ? "bg-emerald-400" : "bg-zinc-600"
+                      }`}
                     style={{
                       height: isListening ? `${8 + (i % 5) * 3}px` : "4px",
                       animation: isListening
@@ -1432,13 +1436,12 @@ export default function InterviewRoomPage() {
             {/* Label Badge */}
             <div className="absolute bottom-3 left-3 z-20 flex items-center gap-2 rounded-lg bg-zinc-950/80 backdrop-blur-md px-3 py-1.5 border border-zinc-800">
               <span
-                className={`h-2 w-2 rounded-full ${
-                  isCameraOn && mediaStream
+                className={`h-2 w-2 rounded-full ${isCameraOn && mediaStream
                     ? "bg-emerald-400 animate-pulse"
                     : isListening
-                    ? "bg-emerald-400 animate-pulse"
-                    : "bg-amber-400"
-                }`}
+                      ? "bg-emerald-400 animate-pulse"
+                      : "bg-amber-400"
+                  }`}
               />
               <span className="text-xs font-semibold text-zinc-200">
                 You (Candidate) {isCameraOn && mediaStream ? "" : "• Cam Off"}
@@ -1485,8 +1488,8 @@ export default function InterviewRoomPage() {
                   {turnState === "processing"
                     ? "Initializing session..."
                     : isAiThinking
-                    ? "AI is thinking..."
-                    : "Transcript will appear here in real-time."}
+                      ? "AI is thinking..."
+                      : "Transcript will appear here in real-time."}
                 </div>
               ) : (
                 transcript.map((entry) => (
@@ -1498,11 +1501,10 @@ export default function InterviewRoomPage() {
                       {entry.speaker === "ai" ? "AI Interviewer" : "Candidate"}
                     </span>
                     <div
-                      className={`max-w-[90%] rounded-xl px-3.5 py-2 text-xs leading-relaxed ${
-                        entry.speaker === "ai"
+                      className={`max-w-[90%] rounded-xl px-3.5 py-2 text-xs leading-relaxed ${entry.speaker === "ai"
                           ? "bg-purple-950/50 text-purple-100 border border-purple-800/40"
                           : "bg-emerald-950/50 text-emerald-100 border border-emerald-800/40"
-                      }`}
+                        }`}
                     >
                       {entry.text}
                     </div>
@@ -1511,14 +1513,23 @@ export default function InterviewRoomPage() {
               )}
 
               {isAiThinking && (
-                <div className="flex flex-col gap-1 items-start">
-                  <span className="text-[10px] font-semibold text-zinc-500 px-1">AI Interviewer</span>
-                  <div className="rounded-xl bg-purple-950/30 border border-purple-800/30 px-3 py-2 text-xs text-purple-300 flex items-center gap-2">
-                    <span className="animate-bounce">•</span>
-                    <span className="animate-bounce" style={{ animationDelay: "0.15s" }}>•</span>
-                    <span className="animate-bounce" style={{ animationDelay: "0.3s" }}>•</span>
-                    <span className="text-zinc-400">Processing answer...</span>
-                  </div>
+                <div className="flex flex-col gap-1 items-start py-1 px-1">
+                  <span className="text-[10px] font-semibold text-zinc-400 px-0.5">AI Interviewer</span>
+                  <LatticeLoader
+                    status="working"
+                    label="Thinking"
+                    pattern="orbit"
+                    grid={3}
+                    shape="round"
+                    color="#ffffff"
+                    doneColor="#22c55e"
+                    errorColor="#ef4444"
+                    cellSize={4}
+                    gap={1.5}
+                    fontSize={11}
+                    step={90}
+                    showTimer={true}
+                  />
                 </div>
               )}
               <div ref={transcriptEndRef} />
@@ -1573,13 +1584,12 @@ export default function InterviewRoomPage() {
             type="button"
             onClick={isListening ? stopListening : startListening}
             disabled={turnState !== "user_turn"}
-            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold transition-all ${
-              isListening
+            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold transition-all ${isListening
                 ? "bg-red-600 hover:bg-red-500 text-white shadow-[0_0_15px_rgba(239,68,68,0.4)]"
                 : turnState === "user_turn"
-                ? "bg-emerald-600 hover:bg-emerald-500 text-white shadow-[0_0_15px_rgba(16,185,129,0.3)]"
-                : "bg-zinc-800 text-zinc-500 cursor-not-allowed"
-            }`}
+                  ? "bg-emerald-600 hover:bg-emerald-500 text-white shadow-[0_0_15px_rgba(16,185,129,0.3)]"
+                  : "bg-zinc-800 text-zinc-500 cursor-not-allowed"
+              }`}
             title="Toggle Mic (Key M)"
           >
             <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
@@ -1593,11 +1603,10 @@ export default function InterviewRoomPage() {
           <button
             type="button"
             onClick={() => setIsCameraOn(!isCameraOn)}
-            className={`flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold border transition-all ${
-              isCameraOn
+            className={`flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold border transition-all ${isCameraOn
                 ? "bg-zinc-800 border-zinc-700 text-zinc-200 hover:bg-zinc-700"
                 : "bg-red-950/40 border-red-800/40 text-red-300"
-            }`}
+              }`}
           >
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
@@ -1609,11 +1618,10 @@ export default function InterviewRoomPage() {
           <button
             type="button"
             onClick={() => setShowTranscriptPanel(!showTranscriptPanel)}
-            className={`flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold border transition-all ${
-              showTranscriptPanel
+            className={`flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold border transition-all ${showTranscriptPanel
                 ? "bg-purple-950/50 border-purple-700 text-purple-300"
                 : "bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700"
-            }`}
+              }`}
             title="Toggle Transcript Drawer"
           >
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1688,11 +1696,10 @@ export default function InterviewRoomPage() {
             <div className="mb-6 rounded-xl bg-zinc-800 p-4">
               <div className="flex items-center justify-between">
                 <span className="text-sm font-medium text-zinc-400">Overall Score</span>
-                <span className={`text-3xl font-bold ${
-                  feedback.overallScore >= 90 ? 'text-emerald-400' :
-                  feedback.overallScore >= 75 ? 'text-green-400' :
-                  feedback.overallScore >= 60 ? 'text-yellow-400' : 'text-red-400'
-                }`}>
+                <span className={`text-3xl font-bold ${feedback.overallScore >= 90 ? 'text-emerald-400' :
+                    feedback.overallScore >= 75 ? 'text-green-400' :
+                      feedback.overallScore >= 60 ? 'text-yellow-400' : 'text-red-400'
+                  }`}>
                   {feedback.overallScore}/100
                 </span>
               </div>
@@ -1702,12 +1709,11 @@ export default function InterviewRoomPage() {
             {/* Hiring Recommendation */}
             <div className="mb-6 rounded-xl bg-zinc-800 p-4">
               <span className="text-sm font-medium text-zinc-400">Hiring Recommendation</span>
-              <div className={`mt-2 inline-flex rounded-full px-3 py-1 text-sm font-medium ${
-                feedback.hiringRecommendation === 'strong_hire' ? 'bg-emerald-900/50 text-emerald-300' :
-                feedback.hiringRecommendation === 'hire' ? 'bg-green-900/50 text-green-300' :
-                feedback.hiringRecommendation === 'consider' ? 'bg-yellow-900/50 text-yellow-300' :
-                'bg-red-900/50 text-red-300'
-              }`}>
+              <div className={`mt-2 inline-flex rounded-full px-3 py-1 text-sm font-medium ${feedback.hiringRecommendation === 'strong_hire' ? 'bg-emerald-900/50 text-emerald-300' :
+                  feedback.hiringRecommendation === 'hire' ? 'bg-green-900/50 text-green-300' :
+                    feedback.hiringRecommendation === 'consider' ? 'bg-yellow-900/50 text-yellow-300' :
+                      'bg-red-900/50 text-red-300'
+                }`}>
                 {feedback.hiringRecommendation.replace('_', ' ').toUpperCase()}
               </div>
             </div>
@@ -1751,11 +1757,10 @@ export default function InterviewRoomPage() {
                     <div key={i} className="rounded-lg bg-zinc-800 p-3">
                       <div className="flex items-center justify-between mb-2">
                         <span className="font-medium text-zinc-200">{skill.skill}</span>
-                        <span className={`text-xs px-2 py-0.5 rounded ${
-                          skill.confidence === 'high' ? 'bg-emerald-900/50 text-emerald-300' :
-                          skill.confidence === 'medium' ? 'bg-yellow-900/50 text-yellow-300' :
-                          'bg-red-900/50 text-red-300'
-                        }`}>
+                        <span className={`text-xs px-2 py-0.5 rounded ${skill.confidence === 'high' ? 'bg-emerald-900/50 text-emerald-300' :
+                            skill.confidence === 'medium' ? 'bg-yellow-900/50 text-yellow-300' :
+                              'bg-red-900/50 text-red-300'
+                          }`}>
                           {skill.confidence}
                         </span>
                       </div>
@@ -1778,12 +1783,11 @@ export default function InterviewRoomPage() {
                         <p className="text-sm font-medium text-zinc-200 mt-1">{qf.question}</p>
                       </div>
                       <div className="mb-3">
-                        <span className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${
-                          qf.answerQuality === 'excellent' ? 'bg-emerald-900/50 text-emerald-300' :
-                          qf.answerQuality === 'good' ? 'bg-green-900/50 text-green-300' :
-                          qf.answerQuality === 'fair' ? 'bg-yellow-900/50 text-yellow-300' :
-                          'bg-red-900/50 text-red-300'
-                        }`}>
+                        <span className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${qf.answerQuality === 'excellent' ? 'bg-emerald-900/50 text-emerald-300' :
+                            qf.answerQuality === 'good' ? 'bg-green-900/50 text-green-300' :
+                              qf.answerQuality === 'fair' ? 'bg-yellow-900/50 text-yellow-300' :
+                                'bg-red-900/50 text-red-300'
+                          }`}>
                           {qf.answerQuality}
                         </span>
                       </div>

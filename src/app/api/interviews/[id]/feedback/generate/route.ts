@@ -165,16 +165,10 @@ export async function POST(
     let validatedFeedback: any;
 
     // Pre-computed exact numbers (code is source of truth)
-    const scoredTopics = state.coverage.filter((t) => t.status === "done" && t.score !== undefined);
-    const computedScore = scoredTopics.length > 0
-      ? Math.round(scoredTopics.reduce((s, t) => s + (t.score ?? 0), 0) / scoredTopics.length * 10)
-      : 50;
-
-    const computedRecommendation: "strong_hire" | "hire" | "consider" | "do_not_hire" =
-      computedScore >= 85 ? "strong_hire"
-      : computedScore >= 70 ? "hire"
-      : computedScore >= 50 ? "consider"
-      : "do_not_hire";
+    const userChunks = chunks.filter((c) => c.speaker === "user");
+    const metrics = calculateInterviewMetrics(state, userChunks.length);
+    const computedScore = metrics.overallScore;
+    const computedRecommendation = metrics.hiringRecommendation;
 
     try {
       const result = await generate({
@@ -252,13 +246,54 @@ export async function POST(
   }
 }
 
-// ─── Signals block builder ────────────────────────────────────────────────────
+// ─── Signals block builder & Metrics Calculator ───────────────────────────────
+
+function calculateInterviewMetrics(state: ConversationState, userChunksCount: number) {
+  const scoredTopics = state.coverage.filter((t) => t.status === "done" && t.score !== undefined);
+  const totalTopicsCount = Math.max(state.coverage.length, 5);
+
+  // If candidate answered 0 turns or provided no candidate speech chunks
+  if (userChunksCount === 0 || scoredTopics.length === 0 || state.scores.length === 0) {
+    return {
+      overallScore: 0,
+      hiringRecommendation: "do_not_hire" as const,
+      summary: "Interview session was closed before the candidate answered any technical questions. Zero responses were recorded.",
+      isAbandoned: true,
+    };
+  }
+
+  // Calculate average across scored topics
+  const totalScoreSum = scoredTopics.reduce((s, t) => s + (t.score ?? 0), 0);
+  const avgTopicScore = totalScoreSum / scoredTopics.length; // scale 0-10
+
+  // Topic completion ratio (e.g. 1 out of 5 topics = 0.2)
+  const completionRatio = scoredTopics.length / totalTopicsCount;
+
+  // Weight overall score by topic completion ratio
+  const overallScore = Math.round(avgTopicScore * 10 * completionRatio);
+
+  const hiringRecommendation: "strong_hire" | "hire" | "consider" | "do_not_hire" =
+    overallScore >= 80 && completionRatio >= 0.8
+      ? "strong_hire"
+      : overallScore >= 65 && completionRatio >= 0.6
+      ? "hire"
+      : overallScore >= 40 && completionRatio >= 0.4
+      ? "consider"
+      : "do_not_hire";
+
+  return {
+    overallScore,
+    hiringRecommendation,
+    summary: `Interview completed across ${scoredTopics.length} of ${totalTopicsCount} topics with a weighted score of ${overallScore}/100.`,
+    isAbandoned: false,
+  };
+}
 
 function buildSignalsBlock(state: ConversationState, interview: any): string {
   const lines: string[] = [];
 
   if (state.scores.length === 0) {
-    lines.push("No per-turn evaluation signals available (interview may have ended early or used old system).");
+    lines.push("No per-turn evaluation signals available (interview was closed early or zero candidate turns recorded).");
     return lines.join("\n");
   }
 
@@ -273,7 +308,7 @@ function buildSignalsBlock(state: ConversationState, interview: any): string {
       const confLabel = conf >= 0.7 ? "high" : conf >= 0.4 ? "medium" : "low_confidence";
       lines.push(`Topic [${topic.label}]: score=${topic.score}/10 confidence=${confLabel} followUps=${topic.followUps}`);
     } else if (topic.status === "todo") {
-      lines.push(`Topic [${topic.label}]: NOT ASSESSED (ran out of time)`);
+      lines.push(`Topic [${topic.label}]: NOT ASSESSED (ran out of time / closed early)`);
     }
   }
 
@@ -296,7 +331,7 @@ function buildSignalsBlock(state: ConversationState, interview: any): string {
     const avg = scoredTopics.reduce((sum, t) => sum + (t.score ?? 0), 0) / scoredTopics.length;
     const scaled = Math.round(avg * 10);
     lines.push("");
-    lines.push(`Computed overallScore from topic averages: ${scaled}/100 (use this as baseline)`);
+    lines.push(`Computed overallScore from topic averages: ${scaled}/100`);
   }
 
   return lines.join("\n");
@@ -305,57 +340,64 @@ function buildSignalsBlock(state: ConversationState, interview: any): string {
 // ─── Grounded fallback (when LLM is unavailable) ─────────────────────────────
 
 function buildGroundedFallback(state: ConversationState, interview: any, chunks: any[]) {
+  const userChunks = chunks.filter((c) => c.speaker === "user");
+  const metrics = calculateInterviewMetrics(state, userChunks.length);
   const scoredTopics = state.coverage.filter((t) => t.status === "done" && t.score !== undefined);
-  const overallScore = scoredTopics.length > 0
-    ? Math.round(scoredTopics.reduce((s, t) => s + (t.score ?? 0), 0) / scoredTopics.length * 10)
-    : 50;
 
   const allStrengths = state.scores.flatMap((s) => s.strengths).filter(Boolean);
   const allGaps = state.scores.flatMap((s) => s.gaps).filter(Boolean);
 
-  const hiringRec: "strong_hire" | "hire" | "consider" | "do_not_hire" =
-    overallScore >= 85 ? "strong_hire"
-    : overallScore >= 70 ? "hire"
-    : overallScore >= 50 ? "consider"
-    : "do_not_hire";
-
   return {
-    overallScore,
-    summary: `Interview completed for ${interview.jobRole} role. Automated scoring based on ${state.scores.length} evaluated turns across ${scoredTopics.length} topics. LLM narrative generation was unavailable.`,
-    strengths: allStrengths.slice(0, 5).length > 0
+    overallScore: metrics.overallScore,
+    summary: metrics.isAbandoned
+      ? `Interview session was closed before the candidate provided any technical answers. Zero responses were recorded.`
+      : `Interview completed for ${interview.jobRole} role. Automated scoring based on ${state.scores.length} evaluated turns across ${scoredTopics.length} topics. LLM narrative generation was unavailable.`,
+    strengths: metrics.isAbandoned
+      ? []
+      : allStrengths.slice(0, 5).length > 0
       ? allStrengths.slice(0, 5)
-      : ["Completed interview session"],
-    areasForImprovement: allGaps.slice(0, 5).length > 0
+      : ["Attempted interview session"],
+    areasForImprovement: metrics.isAbandoned
+      ? ["Candidate exited session before attempting technical questions", "Full interview must be completed for candidate evaluation"]
+      : allGaps.slice(0, 5).length > 0
       ? allGaps.slice(0, 5)
-      : ["Further assessment needed"],
+      : ["Further technical assessment needed"],
     skillAssessments: scoredTopics.map((t) => ({
       skill: t.label,
       demonstrated: (t.score ?? 0) >= 5,
-      confidence: (t.confidence ?? 0) >= 0.7 ? "high" as const : (t.confidence ?? 0) >= 0.4 ? "medium" as const : "low" as const,
+      confidence: (t.confidence ?? 0) >= 0.7 ? ("high" as const) : (t.confidence ?? 0) >= 0.4 ? ("medium" as const) : ("low" as const),
       notes: `Score: ${t.score}/10`,
     })),
-    questionFeedback: state.asked.map((asked, i) => {
+    questionFeedback: state.asked.map((asked) => {
       const score = state.scores.find((s) => s.turnIndex === asked.turnIndex);
       return {
         question: asked.question,
         focusArea: asked.topic,
         answerQuality: score
-          ? score.score >= 8 ? "excellent" as const
-          : score.score >= 6 ? "good" as const
-          : score.score >= 4 ? "fair" as const
-          : "poor" as const
-          : "no_answer" as const,
+          ? score.score >= 8
+            ? ("excellent" as const)
+            : score.score >= 6
+            ? ("good" as const)
+            : score.score >= 4
+            ? ("fair" as const)
+            : ("poor" as const)
+          : ("no_answer" as const),
         strengths: score?.strengths ?? [],
         gaps: score?.gaps ?? [],
-        suggestedImprovement: score && score.confidence < 0.5
-          ? "Insufficient evidence to assess — answer was unclear or very brief"
-          : score?.gaps.length ? `Focus on: ${score.gaps[0]}` : "N/A",
+        suggestedImprovement:
+          score && score.confidence < 0.5
+            ? "Insufficient evidence to assess — answer was unclear or very brief"
+            : score?.gaps.length
+            ? `Focus on: ${score.gaps[0]}`
+            : "N/A",
       };
     }),
-    recommendedFollowUp: scoredTopics.length < state.coverage.length
+    recommendedFollowUp: metrics.isAbandoned
+      ? "Re-invite candidate for a full interview session."
+      : scoredTopics.length < state.coverage.length
       ? `Assess remaining topics: ${state.coverage.filter((t) => t.status !== "done").map((t) => t.label).join(", ")}`
       : "No follow-up required.",
-    hiringRecommendation: hiringRec,
+    hiringRecommendation: metrics.hiringRecommendation,
     interviewDuration: interview.createdAt
       ? Math.round((Date.now() - new Date(interview.createdAt).getTime()) / 60000)
       : 0,

@@ -346,11 +346,10 @@ export default function AdminDashboardPage() {
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id as TabType)}
-                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-medium transition-all cursor-pointer whitespace-nowrap ${
-                  activeTab === tab.id
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-medium transition-all cursor-pointer whitespace-nowrap ${activeTab === tab.id
                     ? "bg-violet-600 text-white shadow-md shadow-violet-600/30"
                     : "text-zinc-400 hover:text-white hover:bg-white/5"
-                }`}
+                  }`}
               >
                 {tab.icon}
                 <span>{tab.label}</span>

@@ -153,10 +153,30 @@ export async function POST(req: NextRequest) {
 
     console.log(`[INITIALIZE] Interview created: ${createdInterview.id} role=${body.jobRole} candidate=${firstName}`);
 
-    return NextResponse.json({
+    const res = NextResponse.json({
       ...createdInterview,
       greeting,
     });
+
+    // Set cookie tracking interview session for resilience across logouts/sessions
+    const existingCookie = req.cookies.get("intervia_interview_ids")?.value ?? "";
+    const ids = new Set(existingCookie.split(",").map((s) => s.trim()).filter(Boolean));
+    ids.add(createdInterview.id);
+
+    res.cookies.set("intervia_interview_ids", Array.from(ids).join(","), {
+      path: "/",
+      maxAge: 60 * 60 * 24 * 365, // 1 year persistence
+      sameSite: "lax",
+      httpOnly: false,
+    });
+    res.cookies.set("intervia_last_interview_id", createdInterview.id, {
+      path: "/",
+      maxAge: 60 * 60 * 24 * 365,
+      sameSite: "lax",
+      httpOnly: false,
+    });
+
+    return res;
   } catch (error) {
     if (error instanceof ZodError) {
       return NextResponse.json(

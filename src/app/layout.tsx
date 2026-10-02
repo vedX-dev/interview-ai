@@ -3,6 +3,7 @@ import { ClerkProvider } from "@clerk/nextjs";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Header } from "@/src/components/header";
+import { CookieConsent } from "@/src/components/cookie-consent";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -26,10 +27,11 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className="dark">
-      <body className={`${geistSans.variable} ${geistMono.variable} antialiased bg-[#09090b] text-[#fafafa]`}>
+      <body className={`${geistSans.variable} ${geistMono.variable} antialiased bg-[#08090c] text-[#fafafa]`}>
         <ClerkProvider>
           <Header />
           {children}
+          <CookieConsent />
         </ClerkProvider>
       </body>
     </html>

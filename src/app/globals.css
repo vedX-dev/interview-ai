@@ -60,24 +60,25 @@ body {
   width: 6px;
   height: 6px;
 }
+
 ::-webkit-scrollbar-track {
   background: #09090b;
 }
+
 ::-webkit-scrollbar-thumb {
   background: #27272a;
   border-radius: 9999px;
 }
+
 ::-webkit-scrollbar-thumb:hover {
   background: #3f3f46;
 }
 
 .glass-nav {
-  background: linear-gradient(
-    90deg,
-    rgba(0, 0, 0, 0.88) 0%,
-    rgba(15, 15, 18, 0.75) 40%,
-    rgba(255, 255, 255, 0.16) 100%
-  );
+  background: linear-gradient(90deg,
+      rgba(0, 0, 0, 0.88) 0%,
+      rgba(15, 15, 18, 0.75) 40%,
+      rgba(255, 255, 255, 0.16) 100%);
   backdrop-filter: blur(24px) saturate(180%);
   -webkit-backdrop-filter: blur(24px) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.18);

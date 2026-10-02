@@ -150,7 +150,7 @@ export default function InterviewFeedbackPage() {
           setTranscript(tData.chunks);
         }
       })
-      .catch(() => {});
+      .catch(() => { });
 
     return () => {
       isMounted = false;
@@ -407,13 +407,12 @@ export default function InterviewFeedbackPage() {
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-zinc-200">{skill.skill}</span>
                     <span
-                      className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase border ${
-                        skill.confidence === "high"
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase border ${skill.confidence === "high"
                           ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
                           : skill.confidence === "medium"
-                          ? "bg-amber-500/20 text-amber-300 border-amber-500/30"
-                          : "bg-zinc-800 text-zinc-400 border-zinc-700"
-                      }`}
+                            ? "bg-amber-500/20 text-amber-300 border-amber-500/30"
+                            : "bg-zinc-800 text-zinc-400 border-zinc-700"
+                        }`}
                     >
                       {skill.confidence} Conf.
                     </span>
@@ -443,10 +442,10 @@ export default function InterviewFeedbackPage() {
                   q.answerQuality === "excellent"
                     ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
                     : q.answerQuality === "good"
-                    ? "bg-green-500/20 text-green-300 border-green-500/30"
-                    : q.answerQuality === "fair"
-                    ? "bg-amber-500/20 text-amber-300 border-amber-500/30"
-                    : "bg-rose-500/20 text-rose-300 border-rose-500/30";
+                      ? "bg-green-500/20 text-green-300 border-green-500/30"
+                      : q.answerQuality === "fair"
+                        ? "bg-amber-500/20 text-amber-300 border-amber-500/30"
+                        : "bg-rose-500/20 text-rose-300 border-rose-500/30";
 
                 return (
                   <div key={idx} className="bg-zinc-950 border border-zinc-800/80 rounded-xl overflow-hidden transition-all">
@@ -591,11 +590,10 @@ export default function InterviewFeedbackPage() {
               {transcript.map((chunk, i) => (
                 <div
                   key={chunk.id || i}
-                  className={`p-3 rounded-xl text-xs space-y-1 ${
-                    chunk.speaker === "ai"
+                  className={`p-3 rounded-xl text-xs space-y-1 ${chunk.speaker === "ai"
                       ? "bg-purple-950/40 border border-purple-800/40 text-purple-100 mr-8"
                       : "bg-zinc-800/80 border border-zinc-700/60 text-zinc-100 ml-8"
-                  }`}
+                    }`}
                 >
                   <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider block">
                     {chunk.speaker === "ai" ? "AI Interviewer" : "Candidate"}

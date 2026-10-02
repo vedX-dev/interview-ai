@@ -60,3 +60,4 @@ drizzle/
 # Markdown documentation files
 *.md
 **/*.md
+.env*

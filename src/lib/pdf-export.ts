@@ -145,7 +145,7 @@ export function generateFeedbackPdf(
   // Score Box
   const scoreBoxWidth = 45;
   const scoreBoxHeight = 35;
-  
+
   let scoreColor: [number, number, number] = colors.emerald;
   if (feedback.overallScore < 70) scoreColor = colors.amber;
   if (feedback.overallScore < 50) scoreColor = colors.rose;

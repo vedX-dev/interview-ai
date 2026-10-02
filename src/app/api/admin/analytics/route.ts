@@ -32,6 +32,8 @@ function getAllowedIPs(): string[] {
 }
 
 function getClientIP(req: NextRequest): string {
+  const cfIp = req.headers.get("cf-connecting-ip");
+  if (cfIp) return cfIp.trim();
   const xff = req.headers.get("x-forwarded-for");
   if (xff) return xff.split(",")[0].trim();
   const realIp = req.headers.get("x-real-ip");

@@ -114,17 +114,21 @@ export function InterviewHistory() {
                 {score !== null && score !== undefined && (
                   <div className="text-right">
                     <div className="text-xs text-zinc-400 font-medium">Score</div>
-                    <div className="text-lg font-bold text-white">
+                    <div className="text-lg font-bold text-[#2b66f6]">
                       {score}/100
                     </div>
                   </div>
                 )}
 
                 <Link
-                  href={`/interview/${item.id}/feedback`}
-                  className="flex items-center gap-1.5 px-3.5 py-2 bg-white text-black hover:bg-zinc-200 rounded-lg text-xs font-semibold transition-all shadow-sm"
+                  href={isCompleted ? `/interview/${item.id}/feedback` : `/interview/${item.id}`}
+                  className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold transition-all shadow-sm ${
+                    isCompleted
+                      ? "bg-[#2b66f6] hover:bg-[#1f52d4] text-white shadow-[0_0_15px_rgba(43,102,246,0.3)]"
+                      : "bg-[#12151e] border border-[#232633] hover:bg-[#191d2a] text-zinc-200"
+                  }`}
                 >
-                  <span>View Report</span>
+                  <span>{isCompleted ? "View Report" : "Resume Interview"}</span>
                   <ArrowRight size={13} />
                 </Link>
               </div>
